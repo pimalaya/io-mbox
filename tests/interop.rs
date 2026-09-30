@@ -24,10 +24,19 @@ fn formail_and_mail_read_what_io_mbox_writes() {
     client.temp_dir = Some(tmp.path().to_path_buf());
     fs::write(tmp.path().join("box"), b"").unwrap();
 
+    // NOTE: message 4 comes with CRLF line endings, which the append must
+    // turn into LF for GNU mail to see its `From_` line.
     let items = (1..=4)
-        .map(|i| MboxEntryAppendItem {
-            contents: format!("From: Alice <alice@example.org>\nTo: bob@example.org\nSubject: message {i}\nMessage-ID: <{i}@example.org>\n\nFrom the start of line {i}\n>From quoted\n").into_bytes(),
-            ..Default::default()
+        .map(|i| {
+            let contents = format!("From: Alice <alice@example.org>\nTo: bob@example.org\nSubject: message {i}\nMessage-ID: <{i}@example.org>\n\nFrom the start of line {i}\n>From quoted\n");
+            let contents = match i {
+                4 => contents.replace('\n', "\r\n"),
+                _ => contents,
+            };
+            MboxEntryAppendItem {
+                contents: contents.into_bytes(),
+                ..Default::default()
+            }
         })
         .collect();
     let entries = client.append("box", items).unwrap();

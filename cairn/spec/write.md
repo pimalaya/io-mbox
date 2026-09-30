@@ -14,7 +14,7 @@ Appending, rewriting and deleting SHALL first check the file exists, then take t
 
 ### Requirement: Appends pad and quote
 
-An append SHALL pad the file so the previous message ends with a blank line, then write each message as a `From_` line (the given sender, else the `Return-Path` or `From` address, else `MAILER-DAEMON`, and the given or current date), its header with the flag fields replaced (and `Content-Length` for the mboxcl variants), its quoted body ended by a newline, and a blank separator line, in one positioned write followed by a sync.
+An append SHALL store each message with LF line endings, converting CRLF ones, since a reader that meets a CRLF `From_` line takes it for body text. It SHALL pad the file so the previous message ends with a blank line, then write each message as a `From_` line (the given sender, else the `Return-Path` or `From` address, else `MAILER-DAEMON`, and the given or current date), its header with the flag fields replaced (and `Content-Length` for the mboxcl variants), its quoted body ended by a newline, and a blank separator line, in one positioned write followed by a sync.
 
 ### Requirement: Rewrites stay in place
 

@@ -389,8 +389,16 @@ fn strip_flags(bytes: &[u8], entries: &[MboxEntry]) -> Vec<u8> {
 }
 
 /// A message as an append stores it: flag fields and `Content-Length`
-/// dropped, a blank line after a header lacking one, a final newline.
+/// dropped, a blank line after a header lacking one, a final newline,
+/// LF line endings.
 fn normalize(message: &[u8]) -> Vec<u8> {
+    let mut lf = Vec::with_capacity(message.len());
+    for (i, byte) in message.iter().enumerate() {
+        if *byte != b'\r' || message.get(i + 1) != Some(&b'\n') {
+            lf.push(*byte);
+        }
+    }
+    let message = lf.as_slice();
     let mut out = Vec::with_capacity(message.len());
     let mut in_header = true;
     let mut dropping = false;

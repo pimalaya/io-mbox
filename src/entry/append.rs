@@ -6,6 +6,11 @@
 //! variants), its quoted body and a separator. The whole batch goes out
 //! in one positioned write at the end of the file.
 //!
+//! Messages are stored with LF line endings, as MTAs deliver them: a
+//! CRLF message is converted. Other readers do not take a CRLF `From_`
+//! line for a separator, and GNU mailutils rewrites such a file with the
+//! line quoted, merging the message into the previous one.
+//!
 //! # Example
 //!
 //! ```rust,no_run
@@ -61,7 +66,8 @@ pub enum MboxEntryAppendError {
 /// A message to append.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct MboxEntryAppendItem {
-    /// The raw message, unquoted, without `From_` line.
+    /// The raw message, unquoted, without `From_` line. CRLF line endings
+    /// are stored as LF.
     pub contents: Vec<u8>,
     /// Flags to store, replacing any flag field the message carries.
     pub flags: MboxFlags,
@@ -269,15 +275,14 @@ impl fmt::Display for State {
 /// Renders one message as stored: `From_` line, header, quoted body and
 /// separator.
 pub(crate) fn render(item: MboxEntryAppendItem, format: MboxFormat, now: i64) -> Vec<u8> {
-    let contents = item.contents;
+    // NOTE: mbox is an LF format, as MTAs deliver it. A reader that meets
+    // a CRLF `From_` line takes it for body text, and a rewrite then
+    // quotes it, merging the message into the previous one.
+    let contents = to_lf(&item.contents);
 
     let header_end = header_end(&contents);
     let (head, rest) = contents.split_at(header_end);
-    let crlf = head
-        .split(|b| *b == b'\n')
-        .next()
-        .is_some_and(|line| line.ends_with(b"\r"));
-    let eol: &[u8] = if crlf { b"\r\n" } else { b"\n" };
+    let eol: &[u8] = b"\n";
 
     let sender = item.sender.unwrap_or_else(|| {
         header::find(head, "Return-Path")
@@ -296,7 +301,7 @@ pub(crate) fn render(item: MboxEntryAppendItem, format: MboxFormat, now: i64) ->
     if !head.is_empty() && !head.ends_with(b"\n") {
         head.extend_from_slice(eol);
     }
-    head.extend(item.flags.to_header(crlf));
+    head.extend(item.flags.to_header(false));
 
     let mut body = if rest.is_empty() {
         eol.to_vec()
@@ -308,21 +313,29 @@ pub(crate) fn render(item: MboxEntryAppendItem, format: MboxFormat, now: i64) ->
     }
 
     let mut out = MboxFromLine::format(&sender, timestamp);
-    if crlf {
-        out.pop();
-        out.extend_from_slice(b"\r\n");
-    }
 
     let body = format.escape(&body);
     out.extend(format.escape(&head));
     if format.has_content_length() {
-        let blank = if body.starts_with(b"\r\n") { 2 } else { 1 };
-        let len = body.len() - blank;
+        let len = body.len() - 1;
         out.extend_from_slice(format!("Content-Length: {len}").as_bytes());
         out.extend_from_slice(eol);
     }
     out.extend(body);
     out.extend_from_slice(eol);
+    out
+}
+
+/// Turns every CRLF line ending into LF, a lone CR being left alone.
+fn to_lf(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut iter = bytes.iter().peekable();
+    while let Some(byte) = iter.next() {
+        if *byte == b'\r' && iter.peek() == Some(&&b'\n') {
+            continue;
+        }
+        out.push(*byte);
+    }
     out
 }
 
@@ -500,16 +513,16 @@ From MAILER-DAEMON Thu Jan  1 00:00:00 1970\nSubject: y\n\nno newline\n\n"
     }
 
     #[test]
-    fn crlf_messages_keep_crlf() {
+    fn crlf_messages_are_stored_with_lf() {
         let mut file = Vec::new();
-        let mut one = item(b"Subject: x\r\n\r\nbody\r\n");
+        let mut one = item(b"Subject: x\r\n\r\nbody\r\nlone\rcr\r\n");
         one.flags = MboxFlags::from_iter([MboxFlag::Seen]);
         let entries = run(&mut file, vec![one], unlocked()).unwrap();
         assert_eq!(
             file,
-            b"From MAILER-DAEMON Thu Jan  1 00:00:00 1970\r\nSubject: x\r\nStatus: R\r\n\r\nbody\r\n\r\n".as_slice()
+            b"From MAILER-DAEMON Thu Jan  1 00:00:00 1970\nSubject: x\nStatus: R\n\nbody\nlone\rcr\n\n".as_slice()
         );
-        assert!(entries[0].crlf);
+        assert!(!entries[0].crlf);
     }
 
     #[test]
