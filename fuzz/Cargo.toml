@@ -1,0 +1,21 @@
+[package]
+name = "io-mbox-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+io-mbox = { path = "..", default-features = false }
+libfuzzer-sys = "0.4"
+
+[[bin]]
+name = "scan"
+path = "fuzz_targets/scan.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

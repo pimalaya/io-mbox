@@ -1,0 +1,21 @@
+From MAILER_DAEMON Mon Jan  1 00:00:00 2024
+Date: Mon, 1 Jan 2024 00:00:00 +0000
+From: Mail System Internal Data <MAILER-DAEMON@localhost>
+Subject: DON'T DELETE THIS MESSAGE -- FOLDER INTERNAL DATA
+Message-ID: <1704067200@localhost>
+X-IMAP: 1704067200 0000000003
+Status: RO
+
+This text is part of the internal format of your mail folder, and is not
+a real message.
+
+From a@example.org Mon Jan  1 00:00:00 2024
+Message-ID: <pseudo-1@example.org>
+Subject: one
+X-UID: 1
+Status: RO
+X-Status: A
+X-Keywords: $Label1 work
+
+body
+

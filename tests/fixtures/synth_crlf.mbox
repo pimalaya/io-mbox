@@ -1,0 +1,13 @@
+From a@example.org Mon Jan  1 00:00:00 2024
+Message-ID: <crlf-1@example.org>
+Subject: crlf one
+Status: RO
+
+body one
+
+From b@example.org Mon Jan  1 00:00:00 2024
+Message-ID: <crlf-2@example.org>
+Subject: crlf two
+
+body two
+

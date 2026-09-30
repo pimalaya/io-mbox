@@ -1,0 +1,62 @@
+[package]
+name = "io-mbox"
+description = "mbox client library for Rust"
+version = "0.1.0"
+authors = ["Clément DOUIN (soywod) <pimalaya.org@posteo.net>"]
+rust-version = "1.88"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+categories = ["email", "filesystem", "no-std"]
+keywords = ["email", "mbox", "client", "std", "io-free"]
+homepage = "https://pimalaya.org"
+documentation = "https://docs.rs/io-mbox/latest/io_mbox"
+repository = "https://github.com/pimalaya/io-mbox"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[features]
+default = ["client", "parser", "serde"]
+client = ["dep:libc"]
+parser = ["dep:mail-parser"]
+serde = ["dep:serde", "mail-parser?/serde"]
+
+[[example]]
+name = "std_list_entries"
+path = "examples/std_list_entries.rs"
+required-features = ["client"]
+
+[[test]]
+name = "corpus"
+path = "tests/corpus.rs"
+required-features = ["client"]
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
+required-features = ["client"]
+
+[dev-dependencies]
+env_logger = "0.11"
+mail-parser = "0.11"
+tempfile = "3.20"
+
+[dependencies]
+log = { version = "0.4", default-features = false }
+mail-parser = { version = "0.11", default-features = false, optional = true }
+memchr = { version = "2", default-features = false }
+serde = { version = "1", default-features = false, features = ["alloc", "derive"], optional = true }
+sha2 = { version = "0.10", default-features = false }
+thiserror = { version = "2", default-features = false }
+
+[target.'cfg(unix)'.dependencies]
+libc = { version = "0.2", optional = true }
+
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
+
+[[test]]
+name = "interop"
+path = "tests/interop.rs"
+required-features = ["client"]

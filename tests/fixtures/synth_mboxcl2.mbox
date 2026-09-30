@@ -1,0 +1,15 @@
+From a@example.org Mon Jan  1 00:00:00 2024
+Message-ID: <cl2-1@example.org>
+Subject: body carries a From_ line
+Content-Length: 65
+
+From b@example.org Mon Jan  1 00:00:00 2024
+still the first body
+
+From c@example.org Tue Jan  2 00:00:00 2024
+Message-ID: <cl2-2@example.org>
+Subject: second
+Content-Length: 5
+
+body
+

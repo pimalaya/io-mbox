@@ -1,0 +1,17 @@
+From - Mon Jan 01 00:00:00 2024
+X-Mozilla-Status: 0005
+X-Mozilla-Status2: 00000000
+X-Mozilla-Keys: todo
+Message-ID: <tb-1@example.org>
+Subject: thunderbird read and flagged
+
+body
+
+From - Mon Jan 01 00:00:00 2024
+X-Mozilla-Status: 0000
+X-Mozilla-Status2: 00010000
+Message-ID: <tb-2@example.org>
+Subject: thunderbird unread
+
+From the start of this line, nothing splits
+
