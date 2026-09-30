@@ -64,17 +64,10 @@ fn fixtures() {
 #[ignore = "needs tests/corpus/fetch.sh"]
 fn corpus() {
     let _ = env_logger::try_init();
-    let mut dirs = vec![Path::new(env!("CARGO_MANIFEST_DIR")).join("target/mbox-corpus")];
-    if let Ok(extra) = env::var("IO_MBOX_CORPUS_DIR") {
-        dirs.extend(
-            extra
-                .split(':')
-                .filter(|d| !d.is_empty())
-                .map(PathBuf::from),
-        );
-    }
-
-    let files: Vec<PathBuf> = dirs.iter().flat_map(|dir| mbox_files(dir)).collect();
+    let files: Vec<PathBuf> = corpus_dirs()
+        .iter()
+        .flat_map(|dir| mbox_files(dir))
+        .collect();
     assert!(
         !files.is_empty(),
         "no corpus found, run tests/corpus/fetch.sh first"
@@ -87,9 +80,12 @@ fn corpus() {
 #[test]
 #[ignore = "needs tests/corpus/fetch.sh, writes about 200 MB"]
 fn large_file_streams() {
-    let source =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("target/mbox-corpus/lore_git_2024_01.mbox");
-    let bytes = fs::read(&source).expect("run tests/corpus/fetch.sh first");
+    let source = corpus_dirs()
+        .into_iter()
+        .map(|dir| dir.join("lore_git_2024_01.mbox"))
+        .find(|path| path.is_file())
+        .expect("run tests/corpus/fetch.sh first");
+    let bytes = fs::read(&source).unwrap();
     let copies = 10;
 
     let tmp = TempDir::new().unwrap();
@@ -118,6 +114,21 @@ fn large_file_streams() {
             .or_default() += 1;
     }
     assert!(counts.values().all(|n| n % copies == 0));
+}
+
+/// target/mbox-corpus, where fetch.sh downloads, then the directories
+/// listed in `IO_MBOX_CORPUS_DIR`.
+fn corpus_dirs() -> Vec<PathBuf> {
+    let mut dirs = vec![Path::new(env!("CARGO_MANIFEST_DIR")).join("target/mbox-corpus")];
+    if let Ok(extra) = env::var("IO_MBOX_CORPUS_DIR") {
+        dirs.extend(
+            extra
+                .split(':')
+                .filter(|d| !d.is_empty())
+                .map(PathBuf::from),
+        );
+    }
+    dirs
 }
 
 fn mbox_files(dir: &Path) -> Vec<PathBuf> {
