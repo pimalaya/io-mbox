@@ -155,7 +155,7 @@ impl MboxIndexSync {
 
         let offset = scanner.offset();
         if !eof && offset < meta.size {
-            let len = chunk_size.min((meta.size - offset) as usize);
+            let len = (meta.size - offset).min(chunk_size as u64) as usize;
             return MboxCoroutineState::Yielded(MboxYield::WantsFileRead {
                 path: self.path.clone(),
                 offset,
@@ -397,6 +397,42 @@ mod tests {
     fn shrinking_reads_stop_at_eof() {
         let out = run(&ONE[..10], Some(meta(ONE.len(), 1)), None, 4).unwrap();
         assert!(out.index.entries.is_empty());
+    }
+
+    #[test]
+    fn a_read_4_gib_before_the_end_is_a_whole_chunk() {
+        const GIB: u64 = 1 << 30;
+
+        let last = MboxEntry {
+            offset: 2 * GIB,
+            ..Default::default()
+        };
+        let index = MboxIndex {
+            meta: MboxFileMeta {
+                size: 3 * GIB,
+                inode: 1,
+                ..Default::default()
+            },
+            tail: tail_hash(b"tail"),
+            entries: vec![last],
+            ..Default::default()
+        };
+        let grown = MboxFileMeta {
+            size: 6 * GIB,
+            inode: 1,
+            ..Default::default()
+        };
+
+        let mut cor = MboxIndexSync::new(MboxFsPath::new("mbox"), Some(index), Default::default());
+        cor.resume(None);
+        cor.resume(Some(MboxReply::FileMeta(Some(grown))));
+        let state = cor.resume(Some(MboxReply::FileRead(b"tail".to_vec())));
+
+        let MboxCoroutineState::Yielded(MboxYield::WantsFileRead { offset, len, .. }) = state
+        else {
+            panic!("unexpected {state:?}");
+        };
+        assert_eq!((offset, len), (2 * GIB, CHUNK_SIZE));
     }
 
     #[test]

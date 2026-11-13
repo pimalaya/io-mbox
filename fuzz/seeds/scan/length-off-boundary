@@ -1,0 +1,23 @@
+3From a@b Mon Jan  1 00:00:00 2024
+Subject: 1
+Content-Length: 2
+
+x
+
+From a@b Mon Jan  1 00:00:00 2024
+Subject: 2
+Content-Length: 40
+
+body two
+
+From a@b Mon Jan  1 00:00:00 2024
+Subject: 3
+
+z
+
+From a@b Mon Jan  1 00:00:00 2024
+Status: RO
+X-Status: F
+
+w
+

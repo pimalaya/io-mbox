@@ -15,7 +15,9 @@
 //! mutt checks it. A length that does not is ignored, the message being
 //! split where it would be without it. Since the scan never looks ahead,
 //! a shadow scanner reads the range unprotected from its first `From_`
-//! line on, and takes over when the length proves wrong.
+//! line on, and takes over when the length proves wrong. Unchecked ranges
+//! nest four deep at most: a length declared inside four of them is
+//! ignored, so a line is never scanned more than five times.
 //!
 //! Each message gets a content id: the SHA-256 of its bytes with the
 //! volatile header fields left out (the flag fields, the c-client and
@@ -48,6 +50,9 @@ const HEADER_CAP: usize = 256 * 1024;
 
 /// Longest run of volatile fields kept to read flags from.
 const VOLATILE_CAP: usize = 64 * 1024;
+
+/// How many unchecked `Content-Length` ranges may nest.
+const DEPTH_CAP: u8 = 4;
 
 /// Header fields left out of the content id, lowercase.
 const VOLATILE_FIELDS: [&str; 10] = [
@@ -90,12 +95,15 @@ pub struct MboxScanner {
     /// Blank line not yet known to be content or a separator.
     pending_blank: Option<(u64, Vec<u8>)>,
     current: Option<Message>,
-    /// How many messages each content hash was seen for.
+    /// How many messages each content hash was seen for, shadows aside.
     seen: BTreeMap<String, u32>,
+    /// The completed entries, their ids not numbered yet.
     entries: Vec<MboxEntry>,
     /// The scan the file would get if the `Content-Length` of the current
     /// message were wrong, from the first `From_` line it protects.
     shadow: Option<Box<Shadow>>,
+    /// How many unchecked `Content-Length` ranges enclose this scan.
+    depth: u8,
 }
 
 /// A scan of the range a `Content-Length` protects, ignoring it.
@@ -103,10 +111,8 @@ pub struct MboxScanner {
 struct Shadow {
     /// The protected message, cut before the first `From_` line.
     first: MboxEntry,
-    /// The scan from that line on.
+    /// The scan from that line on, holding the entries it completed.
     scanner: MboxScanner,
-    /// The entries that scan completed.
-    entries: Vec<MboxEntry>,
 }
 
 impl MboxScanner {
@@ -125,6 +131,7 @@ impl MboxScanner {
             seen: BTreeMap::new(),
             entries: Vec::new(),
             shadow: None,
+            depth: 0,
         }
     }
 
@@ -144,6 +151,28 @@ impl MboxScanner {
 
     /// Feeds the next chunk, returning the entries it completed.
     pub fn feed(&mut self, chunk: &[u8]) -> Vec<MboxEntry> {
+        self.push(chunk);
+        self.take_entries()
+    }
+
+    /// Ends the scan at end of file, returning the entries left.
+    pub fn finish(mut self) -> Vec<MboxEntry> {
+        loop {
+            if !self.line.is_empty() {
+                let line = mem::take(&mut self.line);
+                self.line_complete(&line);
+            }
+            if !self.length_wrong_at_end() || self.shadow.is_none() {
+                break;
+            }
+            self.distrust();
+        }
+        self.close();
+        self.take_entries()
+    }
+
+    /// Scans the next chunk, keeping the entries it completes.
+    fn push(&mut self, chunk: &[u8]) {
         self.offset += chunk.len() as u64;
         let mut rest = chunk;
 
@@ -178,24 +207,26 @@ impl MboxScanner {
                 }
             }
         }
-
-        mem::take(&mut self.entries)
     }
 
-    /// Ends the scan at end of file, returning the entries left.
-    pub fn finish(mut self) -> Vec<MboxEntry> {
-        loop {
-            if !self.line.is_empty() {
-                let line = mem::take(&mut self.line);
-                self.line_complete(&line);
+    /// Takes the completed entries, numbering the ids seen before.
+    fn take_entries(&mut self) -> Vec<MboxEntry> {
+        let mut entries = mem::take(&mut self.entries);
+
+        for entry in &mut entries {
+            let count = self.seen.entry(entry.id.clone()).or_default();
+            *count += 1;
+            if *count > 1 {
+                entry.id = format!("{}-{count}", entry.id);
             }
-            if !self.length_wrong_at_end() || self.shadow.is_none() {
-                break;
-            }
-            self.distrust();
         }
-        self.close();
-        self.entries
+
+        entries
+    }
+
+    /// Whether a `Content-Length` is trusted this deep.
+    fn trusts_length(&self) -> bool {
+        self.opts.content_length && self.depth < DEPTH_CAP
     }
 
     /// Whether the current message declares a body range the end of the
@@ -223,28 +254,35 @@ impl MboxScanner {
 
     /// Checks, at the line starting at `start`, that the body range of
     /// the current message ends on a message boundary, handing over to
-    /// the shadow scan when it does not.
+    /// the shadow scan when it does not, which checks its own in turn.
     fn check_boundary(&mut self, start: u64, line: &[u8]) {
-        let Some(message) = self.current.as_mut() else {
-            return;
-        };
-        let Some(end) = message.protected_until else {
-            return;
-        };
-        let right = match message.boundary {
-            Boundary::Checked => return,
-            Boundary::Unchecked if start < end => return,
-            Boundary::Unchecked if start == end && is_blank(line) => {
-                message.boundary = Boundary::Blank;
+        loop {
+            let Some(message) = self.current.as_mut() else {
+                return;
+            };
+            let Some(end) = message.protected_until else {
+                return;
+            };
+            let right = match message.boundary {
+                Boundary::Checked => return,
+                Boundary::Unchecked if start < end => return,
+                Boundary::Unchecked if start == end && is_blank(line) => {
+                    message.boundary = Boundary::Blank;
+                    return;
+                }
+                Boundary::Unchecked => false,
+                Boundary::Blank => {
+                    line.starts_with(b"From ") && MboxFromLine::parse(line).is_some()
+                }
+            };
+            message.boundary = Boundary::Checked;
+            if right {
+                self.shadow = None;
                 return;
             }
-            Boundary::Unchecked => false,
-            Boundary::Blank => line.starts_with(b"From ") && MboxFromLine::parse(line).is_some(),
-        };
-        message.boundary = Boundary::Checked;
-        if right {
-            self.shadow = None;
-        } else {
+            if self.shadow.is_none() {
+                return;
+            }
             self.distrust();
         }
     }
@@ -255,11 +293,7 @@ impl MboxScanner {
         let Some(shadow) = self.shadow.take() else {
             return;
         };
-        let Shadow {
-            first,
-            mut scanner,
-            entries,
-        } = *shadow;
+        let Shadow { first, mut scanner } = *shadow;
         debug!(
             "ignore the Content-Length of the message at {}",
             first.offset
@@ -267,10 +301,20 @@ impl MboxScanner {
 
         let mut done = mem::take(&mut self.entries);
         done.push(first);
-        done.extend(entries);
         done.append(&mut scanner.entries);
         scanner.entries = done;
+        scanner.seen = mem::take(&mut self.seen);
         scanner.offset = self.offset;
+
+        let mut level = &mut scanner;
+        loop {
+            level.depth -= 1;
+            let Some(shadow) = level.shadow.as_mut() else {
+                break;
+            };
+            level = &mut shadow.scanner;
+        }
+
         *self = scanner;
     }
 
@@ -281,23 +325,17 @@ impl MboxScanner {
         let Some(message) = self.current.clone() else {
             return;
         };
-        let mut seen = self.seen.clone();
-        let first = finalize(message, &mut seen);
+        let first = finalize(message);
         let mut scanner = MboxScanner::new(start, self.opts.clone());
-        scanner.seen = seen;
-        let entries = scanner.feed(line);
-        self.shadow = Some(Box::new(Shadow {
-            first,
-            scanner,
-            entries,
-        }));
+        scanner.depth = self.depth + 1;
+        scanner.push(line);
+        self.shadow = Some(Box::new(Shadow { first, scanner }));
     }
 
     /// Feeds the shadow scan, when there is one.
     fn feed_shadow(&mut self, bytes: &[u8]) {
         if let Some(shadow) = self.shadow.as_mut() {
-            let entries = shadow.scanner.feed(bytes);
-            shadow.entries.extend(entries);
+            shadow.scanner.push(bytes);
         }
     }
 
@@ -336,10 +374,10 @@ impl MboxScanner {
                 // NOTE: a blank line ending the header is still pending, the
                 // body range it opens would start with this very line.
                 None => {
-                    self.opts.content_length
+                    self.trusts_length()
                         && m.in_header
                         && self.pending_blank.is_some()
-                        && m.declared_len().is_some_and(|len| len > 0)
+                        && m.declared_end(start).is_some_and(|end| end > start)
                 }
             },
             None => false,
@@ -405,7 +443,7 @@ impl MboxScanner {
 
     /// Accounts for a blank line that turned out to be content.
     fn blank(&mut self, offset: u64, blank: &[u8]) {
-        let content_length = self.opts.content_length;
+        let trusted = self.trusts_length();
         let Some(message) = self.current.as_mut() else {
             return;
         };
@@ -417,8 +455,8 @@ impl MboxScanner {
         if message.in_header {
             message.in_header = false;
             message.header_len = offset - message.message_offset;
-            if content_length && let Some(len) = message.declared_len() {
-                message.protected_until = Some(message.end + len);
+            if trusted {
+                message.protected_until = message.declared_end(message.end);
             }
         }
     }
@@ -511,8 +549,7 @@ impl MboxScanner {
         let Some(message) = self.current.take() else {
             return;
         };
-        let entry = finalize(message, &mut self.seen);
-        self.entries.push(entry);
+        self.entries.push(finalize(message));
     }
 }
 
@@ -539,9 +576,8 @@ fn is_blank(line: &[u8]) -> bool {
     header::trim_eol(line).is_empty() && line.ends_with(b"\n")
 }
 
-/// Turns a scanned message into its entry, numbering its id after the
-/// ones `seen` counts.
-fn finalize(mut message: Message, seen: &mut BTreeMap<String, u32>) -> MboxEntry {
+/// Turns a scanned message into its entry, its id not numbered yet.
+fn finalize(mut message: Message) -> MboxEntry {
     // NOTE: a final line without newline hashes as if it had one, so
     // adding the newline (as a flag rewrite must) keeps the id.
     if !message.terminated {
@@ -549,13 +585,7 @@ fn finalize(mut message: Message, seen: &mut BTreeMap<String, u32>) -> MboxEntry
     }
 
     let hash = message.hasher.finalize();
-    let hash = base32(&hash[..10]);
-    let count = seen.entry(hash.clone()).or_default();
-    *count += 1;
-    let id = match *count {
-        1 => hash,
-        n => format!("{hash}-{n}"),
-    };
+    let id = base32(&hash[..10]);
 
     let len = message.end - message.message_offset;
     let header_len = if message.in_header {
@@ -635,10 +665,12 @@ struct Message {
 }
 
 impl Message {
-    /// Body length a `Content-Length` field declares.
-    fn declared_len(&self) -> Option<u64> {
+    /// End of the range a `Content-Length` field declares for a body
+    /// starting at `start`, when the field is there and the end an offset.
+    fn declared_end(&self, start: u64) -> Option<u64> {
         let value = header::find(&self.volatile, "content-length")?;
-        String::from_utf8_lossy(&value).trim().parse().ok()
+        let len: u64 = String::from_utf8_lossy(&value).trim().parse().ok()?;
+        start.checked_add(len)
     }
 
     fn new(offset: u64, line: &[u8], from: MboxFromLine) -> Self {
@@ -698,7 +730,7 @@ mod tests {
     use crate::{
         entry::{MboxEntry, MboxSpan},
         flag::MboxFlag,
-        scan::{MboxScanner, MboxScannerOptions, base32},
+        scan::{DEPTH_CAP, MboxScanner, MboxScannerOptions, base32},
     };
 
     fn scan(bytes: &[u8], chunk: usize, opts: MboxScannerOptions) -> Vec<MboxEntry> {
@@ -908,6 +940,207 @@ body two
         check_invariants(&bytes, opts);
     }
 
+    /// Builds `count` messages, each one the body of the one before and
+    /// declaring it whole.
+    fn nested(count: usize) -> Vec<u8> {
+        let mut units = Vec::new();
+        let mut len = b"body\n".len();
+        for _ in 0..count {
+            let unit = format!("From a@b Mon Jan  1 00:00:00 2024\nContent-Length: {len}\n\n");
+            len += unit.len();
+            units.push(unit);
+        }
+
+        let mut bytes: Vec<u8> = units.iter().rev().flat_map(|unit| unit.bytes()).collect();
+        bytes.extend_from_slice(b"body\n");
+        bytes
+    }
+
+    fn shadows(scanner: &MboxScanner) -> usize {
+        let mut count = 0;
+        let mut shadow = scanner.shadow.as_ref();
+        while let Some(next) = shadow {
+            count += 1;
+            shadow = next.scanner.shadow.as_ref();
+        }
+        count
+    }
+
+    #[test]
+    fn nested_content_lengths_open_a_bounded_number_of_scans() {
+        let opts = MboxScannerOptions {
+            content_length: true,
+            ..Default::default()
+        };
+        let bytes = nested(4000);
+        let mut scanner = MboxScanner::new(0, opts);
+
+        for line in bytes.split_inclusive(|b| *b == b'\n') {
+            assert!(scanner.feed(line).is_empty());
+            assert!(shadows(&scanner) <= DEPTH_CAP as usize);
+        }
+
+        assert_eq!(scanner.finish().len(), 1);
+    }
+
+    #[cfg(feature = "client")]
+    #[test]
+    fn nested_content_lengths_fit_a_small_stack() {
+        let run = || {
+            let opts = MboxScannerOptions {
+                content_length: true,
+                ..Default::default()
+            };
+            scan(&nested(4000), usize::MAX, opts).len()
+        };
+
+        let thread = std::thread::Builder::new().stack_size(256 * 1024);
+        assert_eq!(thread.spawn(run).unwrap().join().unwrap(), 1);
+    }
+
+    #[test]
+    fn nested_content_lengths_wrong_at_the_same_line_are_all_ignored() {
+        let opts = MboxScannerOptions {
+            content_length: true,
+            ..Default::default()
+        };
+        let bytes = b"\
+From a@b Mon Jan  1 00:00:00 2024
+Content-Length: 90
+
+From c@d Mon Jan  1 00:00:00 2024
+Content-Length: 36
+
+
+From e@f Mon Jan  1 00:00:00 2024
+
+From g@h Mon Jan  1 00:00:00 2024
+Content-Length: 34
+
+x
+
+From i@j Mon Jan  1 00:00:00 2024
+y
+";
+
+        let entries = scan_all_chunk_sizes(bytes, opts.clone());
+        let senders: Vec<&str> = entries.iter().map(|e| e.sender.as_str()).collect();
+        assert_eq!(senders, ["a@b", "c@d", "e@f", "g@h", "i@j"]);
+        assert_eq!(entries, scan(bytes, bytes.len(), Default::default()));
+        check_invariants(bytes, opts);
+    }
+
+    #[test]
+    fn a_content_length_inside_four_unchecked_ranges_is_ignored() {
+        let opts = MboxScannerOptions {
+            content_length: true,
+            ..Default::default()
+        };
+        let outer = "From o@o Mon Jan  1 00:00:00 2024\nContent-Length: 9999\n\n";
+        let body = "x\n\nFrom q@q Mon Jan  1 00:00:00 2024\ny\n";
+        let inner = format!(
+            "From i@i Mon Jan  1 00:00:00 2024\nContent-Length: {}\n\n{body}",
+            body.len()
+        );
+
+        for ranges in 0..=DEPTH_CAP as usize {
+            let bytes = [outer.repeat(ranges), inner.clone()].concat();
+            let entries = scan_all_chunk_sizes(bytes.as_bytes(), opts.clone());
+            let senders: Vec<&str> = entries.iter().map(|e| e.sender.as_str()).collect();
+
+            let mut expected = vec!["o@o"; ranges];
+            expected.push("i@i");
+            if ranges == DEPTH_CAP as usize {
+                expected.push("q@q");
+            }
+            assert_eq!(senders, expected);
+            check_invariants(bytes.as_bytes(), opts.clone());
+        }
+    }
+
+    #[test]
+    fn a_content_length_proved_wrong_frees_its_nesting_level() {
+        let opts = MboxScannerOptions {
+            content_length: true,
+            ..Default::default()
+        };
+        let wrong = "From w@w Mon Jan  1 00:00:00 2024\nContent-Length: 40\n\nx\n\n";
+        let body = "x\n\nFrom q@q Mon Jan  1 00:00:00 2024\ny\n";
+        let right = format!(
+            "From r@r Mon Jan  1 00:00:00 2024\nContent-Length: {}\n\n{body}\n",
+            body.len()
+        );
+        let last = "From z@z Mon Jan  1 00:00:00 2024\n";
+        let bytes = [&wrong.repeat(6), right.as_str(), last].concat();
+
+        let entries = scan_all_chunk_sizes(bytes.as_bytes(), opts.clone());
+        let senders: Vec<&str> = entries.iter().map(|e| e.sender.as_str()).collect();
+        assert_eq!(
+            senders,
+            ["w@w", "w@w", "w@w", "w@w", "w@w", "w@w", "r@r", "z@z"]
+        );
+        check_invariants(bytes.as_bytes(), opts);
+    }
+
+    #[test]
+    fn duplicates_are_numbered_through_an_ignored_content_length() {
+        let opts = MboxScannerOptions {
+            content_length: true,
+            ..Default::default()
+        };
+        let one = "From a@b Mon Jan  1 00:00:00 2024\nSubject: x\n\nbody\n\n";
+        let wrong =
+            "From a@b Mon Jan  1 00:00:00 2024\nSubject: x\nContent-Length: 9999\n\nbody\n\n";
+        let bytes = [one, wrong, one, one].concat();
+
+        let entries = scan_all_chunk_sizes(bytes.as_bytes(), opts);
+        let hash = entries[0].id.clone();
+        let ids: Vec<&str> = entries.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                hash.clone(),
+                format!("{hash}-2"),
+                format!("{hash}-3"),
+                format!("{hash}-4")
+            ]
+        );
+    }
+
+    #[test]
+    fn a_shadow_scan_counts_no_ids() {
+        let opts = MboxScannerOptions {
+            content_length: true,
+            ..Default::default()
+        };
+        let mut scanner = MboxScanner::new(0, opts);
+        scanner.seed(["a", "b", "c"]);
+        scanner.feed(&nested(2));
+
+        let shadow = scanner.shadow.as_ref().unwrap();
+        assert!(shadow.scanner.seen.is_empty());
+    }
+
+    #[test]
+    fn a_content_length_past_the_last_offset_is_ignored() {
+        let opts = MboxScannerOptions {
+            content_length: true,
+            ..Default::default()
+        };
+
+        for body in ["x\n\n", ""] {
+            let mut bytes = b"From a@b Mon Jan  1 00:00:00 2024\n".to_vec();
+            bytes.extend_from_slice(b"Content-Length: 18446744073709551615\n\n");
+            bytes.extend_from_slice(body.as_bytes());
+            bytes.extend_from_slice(b"From c@d Mon Jan  1 00:00:00 2024\n\ny\n");
+
+            let entries = scan_all_chunk_sizes(&bytes, opts.clone());
+            assert_eq!(entries.len(), 2, "body {body:?}");
+            assert_eq!(entries, scan(&bytes, bytes.len(), Default::default()));
+            check_invariants(&bytes, opts.clone());
+        }
+    }
+
     #[test]
     fn long_lines_stream() {
         let mut bytes = b"From a@b Mon Jan  1 00:00:00 2024\nX-Long: ".to_vec();
@@ -1000,6 +1233,20 @@ body two
             b"\n\nFrom a@b Mon Jan  1 00:00:00 2024\n",
             b"X-IMAP: 1",
         ];
+        const NESTED: [&[u8]; 12] = [
+            b"From a@b Mon Jan  1 00:00:00 2024\n",
+            b"\nFrom c@d Mon Jan  1 00:00:00 2024\n",
+            b"\n",
+            b"\n",
+            b"x\n",
+            b"Subject: s\n",
+            b"Content-Length: 3\n",
+            b"Content-Length: 36\n",
+            b"Content-Length: 37\n",
+            b"Content-Length: 90\n",
+            b"Content-Length: 9999\n\n",
+            b"Content-Length: 18446744073709551615\n",
+        ];
 
         let mut state = 0x2545_f491_4f6c_dd1du64;
         let mut next = || {
@@ -1009,18 +1256,20 @@ body two
             state
         };
 
-        for _ in 0..3000 {
-            let len = next() % 60;
-            let mut bytes = Vec::new();
-            for _ in 0..len {
-                bytes.extend_from_slice(TOKENS[(next() % TOKENS.len() as u64) as usize]);
+        for tokens in [TOKENS.as_slice(), NESTED.as_slice()] {
+            for _ in 0..3000 {
+                let len = next() % 60;
+                let mut bytes = Vec::new();
+                for _ in 0..len {
+                    bytes.extend_from_slice(tokens[(next() % tokens.len() as u64) as usize]);
+                }
+                let content_length = next() % 2 == 0;
+                let opts = MboxScannerOptions {
+                    content_length,
+                    header: true,
+                };
+                check_invariants(&bytes, opts);
             }
-            let content_length = next() % 2 == 0;
-            let opts = MboxScannerOptions {
-                content_length,
-                header: true,
-            };
-            check_invariants(&bytes, opts);
         }
     }
 }

@@ -14,7 +14,7 @@ An index SHALL carry the entries, the scanner options they were produced with, t
 
 ### Requirement: Sync scans only what changed
 
-Syncing SHALL reuse an index whose stat matches the file and whose options match the requested ones. A file that only grew, on the same inode, with the old last 4 KiB unchanged SHALL be scanned from the last entry of the index onwards. Any other change SHALL trigger a full scan. The result SHALL equal a full scan in every case.
+Syncing SHALL reuse an index whose stat matches the file and whose options match the requested ones. A file that only grew, on the same inode, with the old last 4 KiB unchanged SHALL be scanned from the last entry of the index onwards. Any other change SHALL trigger a full scan. The result SHALL equal a full scan in every case. Each read SHALL ask for the read size or for what is left of the file, whichever is smaller, whatever the file size and the word size of the target.
 
 ### Requirement: Reads check the entry
 

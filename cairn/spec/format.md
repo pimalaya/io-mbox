@@ -20,7 +20,7 @@ A line SHALL open a message only when it starts with `From `, follows a blank li
 
 ### Requirement: Four variants
 
-The crate SHALL read mboxo, mboxrd, mboxcl and mboxcl2, and write any of them, mboxrd by default. mboxo and mboxcl quote a `From ` line with one `>`, mboxrd quotes every `>*From ` line, mboxcl2 quotes nothing. Reading undoes the quoting of the configured variant. A `Content-Length` field SHALL be trusted only when the reader is told the file is an mboxcl variant, and only when the body range it declares ends on a message boundary: a blank line then a `From_` line, or the end of the file, as mutt checks it. A trusted length keeps any `From_` line inside its range from opening a message; a length off the boundary SHALL be ignored, the message split where it would be without it.
+The crate SHALL read mboxo, mboxrd, mboxcl and mboxcl2, and write any of them, mboxrd by default. mboxo and mboxcl quote a `From ` line with one `>`, mboxrd quotes every `>*From ` line, mboxcl2 quotes nothing. Reading undoes the quoting of the configured variant. A `Content-Length` field SHALL be trusted only when the reader is told the file is an mboxcl variant, and only when the body range it declares ends on a message boundary: a blank line then a `From_` line, or the end of the file, as mutt checks it. A trusted length keeps any `From_` line inside its range from opening a message; a length off the boundary SHALL be ignored, the message split where it would be without it. A `Content-Length` declared inside four ranges not yet checked, or whose range would end past the largest file offset, SHALL be ignored too.
 
 #### Scenario: A Content-Length running past the next message
 

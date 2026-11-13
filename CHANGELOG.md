@@ -25,6 +25,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - A `Content-Length` whose body range does not end on a message boundary is ignored, as mutt does, instead of merging the following messages into one.
 - A huge lock timeout no longer overflows.
+- A `Content-Length` declared inside four unchecked `Content-Length` ranges is ignored, so a line is scanned five times at most however deep a message nests them.
+- A `Content-Length` too large for a file offset is ignored instead of overflowing.
+- An index sync on a 32-bit target no longer stops early when a multiple of 4 GiB is left to scan.
 
 ## [0.1.0] - 2026-09-30
 

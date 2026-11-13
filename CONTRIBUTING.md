@@ -38,9 +38,12 @@ The interoperability test needs formail and GNU mailutils:
 nix shell nixpkgs#procmail nixpkgs#mailutils -c nix develop --command cargo test --test interop -- --ignored
 ```
 
-The scanner fuzz target needs a nightly toolchain and cargo-fuzz; seeding it with the fixtures speeds it up:
+The scanner fuzz target needs a nightly toolchain and cargo-fuzz. The first byte of an input picks the scanner options and the read size, so a seed opens on one: `3` trusts `Content-Length` and keeps headers. fuzz/seeds/scan holds the `Content-Length` shapes and fuzz/scan.dict the tokens; seeding with the fixtures as well speeds it up:
 
 ```sh
-mkdir -p fuzz/corpus/scan && cp tests/fixtures/*.mbox fuzz/corpus/scan/
-cargo +nightly fuzz run scan fuzz/corpus/scan -- -max_total_time=300
+mkdir -p fuzz/corpus/scan
+for mbox in tests/fixtures/*.mbox; do
+  { printf 3; cat "$mbox"; } > "fuzz/corpus/scan/$(basename "$mbox")"
+done
+cargo +nightly fuzz run scan fuzz/corpus/scan fuzz/seeds/scan -- -dict=fuzz/scan.dict -max_total_time=300
 ```
