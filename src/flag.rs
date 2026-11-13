@@ -23,10 +23,17 @@ use core::fmt;
 
 use alloc::{collections::BTreeSet, string::String, vec::Vec};
 
+use thiserror::Error;
+
 use crate::header;
 
 /// Header fields [`MboxFlags::to_header`] writes, lowercase.
 pub(crate) const FLAG_FIELDS: [&str; 3] = ["status", "x-status", "x-keywords"];
+
+/// Longest [`MboxKeyword`], in bytes.
+///
+/// Refs: <https://datatracker.ietf.org/doc/html/rfc8621#section-4.1.1>
+const KEYWORD_CAP: usize = 255;
 
 /// The `X-Mozilla-Status` bits standing for flags: read, replied, marked
 /// and expunged.
@@ -55,7 +62,56 @@ pub enum MboxFlag {
     /// `X-Status: D`, the message is marked for deletion.
     Deleted,
     /// A custom keyword from `X-Keywords`.
-    Keyword(String),
+    Keyword(MboxKeyword),
+}
+
+/// A custom keyword, checked to read back as written from `X-Keywords`.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(try_from = "String", into = "String"))]
+pub struct MboxKeyword(String);
+
+impl MboxKeyword {
+    /// Checks `keyword`: not empty, 255 bytes at most, no whitespace at
+    /// either end, and no ASCII whitespace, comma or control character.
+    pub fn new(keyword: impl Into<String>) -> Result<Self, MboxKeywordError> {
+        let keyword = keyword.into();
+
+        if keyword.is_empty() {
+            return Err(MboxKeywordError::Empty);
+        }
+
+        if keyword.len() > KEYWORD_CAP {
+            return Err(MboxKeywordError::TooLong(keyword.len()));
+        }
+
+        let splits = |c: char| c == ',' || c.is_ascii_whitespace() || c.is_control();
+        if keyword.trim() != keyword || keyword.contains(splits) {
+            return Err(MboxKeywordError::Unwritable(keyword));
+        }
+
+        Ok(Self(keyword))
+    }
+
+    /// Returns the keyword as a `&str`.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Why a string is no [`MboxKeyword`].
+#[derive(Clone, Debug, Eq, PartialEq, Error)]
+pub enum MboxKeywordError {
+    /// The keyword is empty.
+    #[error("Mbox keyword is empty")]
+    Empty,
+    /// The keyword is longer than 255 bytes, its length given.
+    #[error("Mbox keyword of {0} bytes is longer than 255 bytes")]
+    TooLong(usize),
+    /// The keyword holds a whitespace, a comma or a control character,
+    /// which an `X-Keywords` field would not give back.
+    #[error("Mbox keyword {0:?} holds a whitespace, a comma or a control character")]
+    Unwritable(String),
 }
 
 /// The flag set of an mbox message.
@@ -201,7 +257,7 @@ impl MboxFlags {
         for flag in self.iter() {
             if let MboxFlag::Keyword(keyword) = flag {
                 out.push(b' ');
-                out.extend_from_slice(keyword.as_bytes());
+                out.extend_from_slice(keyword.as_str().as_bytes());
             }
         }
         out.extend_from_slice(if crlf { b"\r\n" } else { b"\n" });
@@ -223,10 +279,30 @@ impl MboxFlags {
     fn insert_keywords(&mut self, value: &[u8]) {
         let value = String::from_utf8_lossy(value);
         for keyword in value.split(|c: char| c == ',' || c.is_ascii_whitespace()) {
-            if !keyword.is_empty() {
-                self.insert(MboxFlag::Keyword(keyword.into()));
+            if let Ok(keyword) = MboxKeyword::new(keyword) {
+                self.insert(MboxFlag::Keyword(keyword));
             }
         }
+    }
+}
+
+impl TryFrom<String> for MboxKeyword {
+    type Error = MboxKeywordError;
+
+    fn try_from(keyword: String) -> Result<Self, Self::Error> {
+        Self::new(keyword)
+    }
+}
+
+impl From<MboxKeyword> for String {
+    fn from(keyword: MboxKeyword) -> Self {
+        keyword.0
+    }
+}
+
+impl fmt::Display for MboxKeyword {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
     }
 }
 
@@ -251,7 +327,7 @@ impl fmt::Display for MboxFlag {
             Self::Flagged => f.write_str("flagged"),
             Self::Draft => f.write_str("draft"),
             Self::Deleted => f.write_str("deleted"),
-            Self::Keyword(keyword) => f.write_str(keyword),
+            Self::Keyword(keyword) => f.write_str(keyword.as_str()),
         }
     }
 }
@@ -260,10 +336,66 @@ impl fmt::Display for MboxFlag {
 mod tests {
     use alloc::string::ToString;
 
-    use crate::flag::{MboxFlag, MboxFlags};
+    use crate::flag::{MboxFlag, MboxFlags, MboxKeyword, MboxKeywordError};
 
     fn flags(list: &[MboxFlag]) -> MboxFlags {
         list.iter().cloned().collect()
+    }
+
+    fn keyword(keyword: &str) -> MboxFlag {
+        MboxFlag::Keyword(MboxKeyword::new(keyword).unwrap())
+    }
+
+    #[test]
+    fn a_keyword_that_would_not_read_back_is_refused() {
+        let forged = "x\n\nFrom z@z Mon Jan  1 00:00:00 2024\nSubject: forged";
+        for bad in [
+            "a b", "a,b", "a\tb", "a\r", forged, "a\0", "\u{7f}", "\u{85}a",
+        ] {
+            let err = MboxKeyword::new(bad).unwrap_err();
+            assert_eq!(err, MboxKeywordError::Unwritable(bad.into()), "{bad:?}");
+        }
+        for bad in ["\u{a0}a", "a\u{2003}"] {
+            assert!(MboxKeyword::new(bad).is_err(), "{bad:?}");
+        }
+        assert_eq!(MboxKeyword::new(""), Err(MboxKeywordError::Empty));
+        let long = "a".repeat(256);
+        assert_eq!(MboxKeyword::new(long), Err(MboxKeywordError::TooLong(256)));
+
+        let longest = "a".repeat(255);
+        for good in [
+            "$Label1",
+            "\\Custom",
+            "caf\u{e9}",
+            "a\u{a0}b",
+            longest.as_str(),
+        ] {
+            let set = flags(&[keyword(good), MboxFlag::Seen]);
+            assert_eq!(MboxFlags::from_header(&set.to_header(true)), set);
+            let keys = set.to_mozilla_keys(false);
+            assert_eq!(MboxFlags::from_header(&keys), flags(&[keyword(good)]));
+        }
+    }
+
+    #[test]
+    fn a_field_token_that_is_no_keyword_is_left_out() {
+        let block = b"X-Keywords: ok \x01bad also,\xc2\x85nel\n";
+        let expected = flags(&[keyword("ok"), keyword("also")]);
+        assert_eq!(MboxFlags::from_header(block), expected);
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn a_keyword_is_checked_when_deserialized() {
+        use serde::{
+            Deserialize,
+            de::{IntoDeserializer, value::Error},
+        };
+
+        let good: Result<MboxKeyword, Error> = MboxKeyword::deserialize("a".into_deserializer());
+        assert_eq!(good.unwrap().as_str(), "a");
+        let bad: Result<MboxKeyword, Error> = MboxKeyword::deserialize("a b".into_deserializer());
+        assert!(bad.is_err());
     }
 
     #[test]
@@ -276,9 +408,9 @@ mod tests {
             MboxFlag::Flagged,
             MboxFlag::Draft,
             MboxFlag::Deleted,
-            MboxFlag::Keyword("$Label1".into()),
-            MboxFlag::Keyword("work".into()),
-            MboxFlag::Keyword("junk".into()),
+            keyword("$Label1"),
+            keyword("work"),
+            keyword("junk"),
         ]);
         assert_eq!(MboxFlags::from_header(block), expected);
     }
@@ -286,11 +418,7 @@ mod tests {
     #[test]
     fn mozilla_fields_are_a_fallback() {
         let block = b"X-Mozilla-Status: 0005\nX-Mozilla-Keys: todo\n";
-        let expected = flags(&[
-            MboxFlag::Seen,
-            MboxFlag::Flagged,
-            MboxFlag::Keyword("todo".into()),
-        ]);
+        let expected = flags(&[MboxFlag::Seen, MboxFlag::Flagged, keyword("todo")]);
         assert_eq!(MboxFlags::from_header(block), expected);
 
         let block = b"X-Mozilla-Status: 000a\nStatus: O\n";
@@ -313,8 +441,8 @@ mod tests {
             MboxFlag::Flagged,
             MboxFlag::Draft,
             MboxFlag::Deleted,
-            MboxFlag::Keyword("a".into()),
-            MboxFlag::Keyword("b".into()),
+            keyword("a"),
+            keyword("b"),
         ]);
         let header = all.to_header(false);
         assert_eq!(
@@ -338,7 +466,7 @@ mod tests {
         assert_eq!(set.iter().count(), 2);
         assert!(set.remove(&MboxFlag::Seen));
         assert!(!set.remove(&MboxFlag::Seen));
-        assert_eq!(MboxFlag::Keyword("k".into()).to_string(), "k");
+        assert_eq!(keyword("k").to_string(), "k");
         assert_eq!(MboxFlag::Deleted.to_string(), "deleted");
         for (flag, name) in [
             (MboxFlag::Seen, "seen"),

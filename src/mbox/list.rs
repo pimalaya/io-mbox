@@ -4,13 +4,16 @@
 //! hidden files and the side files of other tools (`.lock` dotlocks,
 //! Thunderbird `.msf` summaries). The spool, when set, is listed as
 //! `INBOX` if it exists.
+//!
+//! Each directory is walked once, whatever symbolic links lead to it: the
+//! walk tracks the canonical path of every directory it reaches, and a
+//! link to a directory is followed last, only when it leads somewhere
+//! new. A directory below the root is so listed under its own name, and a
+//! link back into the tree cannot make the walk loop.
 
 use core::{fmt, mem};
 
-use alloc::{
-    collections::{BTreeSet, VecDeque},
-    vec::Vec,
-};
+use alloc::collections::{BTreeSet, VecDeque};
 
 use log::{debug, trace};
 use thiserror::Error;
@@ -37,7 +40,12 @@ pub enum MboxListError {
 #[derive(Debug)]
 pub struct MboxList {
     store: MboxStore,
-    dirs: VecDeque<MboxFsPath>,
+    /// Directories left to read, each with its canonical path.
+    dirs: VecDeque<(MboxFsPath, MboxFsPath)>,
+    /// Links to a directory, resolved once no directory is left to read.
+    links: VecDeque<MboxFsPath>,
+    /// Canonical paths of the directories reached.
+    reached: BTreeSet<MboxFsPath>,
     mboxes: BTreeSet<Mbox>,
     state: State,
 }
@@ -45,19 +53,32 @@ pub struct MboxList {
 impl MboxList {
     /// Builds a coroutine listing the mailboxes of `store`.
     pub fn new(store: MboxStore) -> Self {
-        let dirs = VecDeque::from([store.root.clone()]);
         Self {
             store,
-            dirs,
+            dirs: VecDeque::new(),
+            links: VecDeque::new(),
+            reached: BTreeSet::new(),
             mboxes: BTreeSet::new(),
             state: State::Start,
         }
     }
 
+    /// Queues the directory at `path` unless `canonical` was reached.
+    fn reach(&mut self, path: MboxFsPath, canonical: MboxFsPath) {
+        if self.reached.insert(canonical.clone()) {
+            self.dirs.push_back((path, canonical));
+        }
+    }
+
     fn next_dir(&mut self) -> MboxCoroutineState<MboxYield, <Self as MboxCoroutine>::Return> {
-        if let Some(dir) = self.dirs.pop_front() {
-            self.state = State::ReadDir;
+        if let Some((dir, canonical)) = self.dirs.pop_front() {
+            self.state = State::ReadDir(canonical);
             return MboxCoroutineState::Yielded(MboxYield::WantsDirRead(dir));
+        }
+
+        if let Some(link) = self.links.pop_front() {
+            self.state = State::ResolveLink(link.clone());
+            return MboxCoroutineState::Yielded(MboxYield::WantsDirCanonical(link));
         }
 
         if let Some(inbox) = self.store.inbox.clone() {
@@ -81,10 +102,27 @@ impl MboxCoroutine for MboxList {
     type Return = Result<BTreeSet<Mbox>, MboxListError>;
 
     fn resume(&mut self, arg: Option<MboxReply>) -> MboxCoroutineState<Self::Yield, Self::Return> {
-        match (&self.state, arg) {
-            (State::Start, None) => self.next_dir(),
-            (State::ReadDir, Some(MboxReply::DirRead(entries))) => {
-                let mut dirs = Vec::new();
+        match (&mut self.state, arg) {
+            (State::Start, None) => {
+                self.state = State::ResolveRoot;
+                let root = self.store.root.clone();
+                MboxCoroutineState::Yielded(MboxYield::WantsDirCanonical(root))
+            }
+            (State::ResolveRoot, Some(MboxReply::DirCanonical(canonical))) => {
+                let root = self.store.root.clone();
+                let canonical = canonical.unwrap_or_else(|| root.clone());
+                self.reach(root, canonical);
+                self.next_dir()
+            }
+            (State::ResolveLink(link), Some(MboxReply::DirCanonical(canonical))) => {
+                let link = mem::take(link);
+                if let Some(canonical) = canonical {
+                    self.reach(link, canonical);
+                }
+                self.next_dir()
+            }
+            (State::ReadDir(canonical), Some(MboxReply::DirRead(entries))) => {
+                let canonical = mem::take(canonical);
                 for (path, kind) in entries {
                     let Some(name) = path.file_name() else {
                         continue;
@@ -93,7 +131,11 @@ impl MboxCoroutine for MboxList {
                         continue;
                     }
                     match kind {
-                        MboxFileKind::Dir => dirs.push(path),
+                        MboxFileKind::Dir => {
+                            let canonical = canonical.join(name);
+                            self.reach(path, canonical);
+                        }
+                        MboxFileKind::DirLink => self.links.push_back(path),
                         MboxFileKind::File => {
                             if IGNORED_SUFFIXES.iter().any(|suffix| name.ends_with(suffix)) {
                                 continue;
@@ -108,14 +150,13 @@ impl MboxCoroutine for MboxList {
                         MboxFileKind::Other => {}
                     }
                 }
-                self.dirs.extend(dirs);
                 self.next_dir()
             }
             (State::StatInbox(inbox), Some(MboxReply::FileMeta(meta))) => {
                 if meta.is_some() {
                     let mbox = Mbox {
                         name: MboxPath::from(INBOX),
-                        path: inbox.clone(),
+                        path: mem::take(inbox),
                     };
                     self.mboxes.insert(mbox);
                 }
@@ -129,7 +170,10 @@ impl MboxCoroutine for MboxList {
 #[derive(Debug)]
 enum State {
     Start,
-    ReadDir,
+    ResolveRoot,
+    /// Reading a directory, of which this is the canonical path.
+    ReadDir(MboxFsPath),
+    ResolveLink(MboxFsPath),
     StatInbox(MboxFsPath),
     Done,
 }
@@ -138,7 +182,9 @@ impl fmt::Display for State {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Start => f.write_str("start"),
-            Self::ReadDir => f.write_str("read dir"),
+            Self::ResolveRoot => f.write_str("resolve root"),
+            Self::ReadDir(_) => f.write_str("read dir"),
+            Self::ResolveLink(_) => f.write_str("resolve link"),
             Self::StatInbox(_) => f.write_str("stat inbox"),
             Self::Done => f.write_str("done"),
         }
@@ -169,7 +215,11 @@ mod tests {
         let mut cor = MboxList::new(store);
         assert!(matches!(
             cor.resume(None),
-            MboxCoroutineState::Yielded(MboxYield::WantsDirRead(_))
+            MboxCoroutineState::Yielded(MboxYield::WantsDirCanonical(p)) if p.as_str() == "/m"
+        ));
+        assert!(matches!(
+            cor.resume(Some(MboxReply::DirCanonical(None))),
+            MboxCoroutineState::Yielded(MboxYield::WantsDirRead(p)) if p.as_str() == "/m"
         ));
 
         let root = dir(&[
@@ -199,6 +249,74 @@ mod tests {
     }
 
     #[test]
+    fn walks_each_directory_once_whatever_links_lead_to_it() {
+        let dirs = BTreeMap::from([
+            (
+                "/m",
+                dir(&[
+                    ("/m/a", MboxFileKind::File),
+                    ("/m/back", MboxFileKind::DirLink),
+                    ("/m/far", MboxFileKind::DirLink),
+                    ("/m/gone", MboxFileKind::DirLink),
+                    ("/m/sub", MboxFileKind::Dir),
+                    ("/m/twin", MboxFileKind::DirLink),
+                ]),
+            ),
+            (
+                "/m/sub",
+                dir(&[
+                    ("/m/sub/b", MboxFileKind::File),
+                    ("/m/sub/up", MboxFileKind::DirLink),
+                ]),
+            ),
+            (
+                "/m/far",
+                dir(&[
+                    ("/m/far/c", MboxFileKind::File),
+                    ("/m/far/deep", MboxFileKind::Dir),
+                    ("/m/far/self", MboxFileKind::DirLink),
+                ]),
+            ),
+            ("/m/far/deep", dir(&[("/m/far/deep/d", MboxFileKind::File)])),
+        ]);
+        let canonical = BTreeMap::from([
+            ("/m", "/real/m"),
+            ("/m/back", "/real/m"),
+            ("/m/far", "/far"),
+            ("/m/twin", "/real/m/sub"),
+            ("/m/sub/up", "/real/m"),
+            ("/m/far/self", "/far"),
+        ]);
+
+        let store = MboxStore {
+            root: MboxFsPath::new("/m"),
+            ..Default::default()
+        };
+        let mut cor = MboxList::new(store);
+        let mut read = Vec::new();
+        let mut arg = None;
+        let mboxes = loop {
+            match cor.resume(arg.take()) {
+                MboxCoroutineState::Complete(result) => break result.unwrap(),
+                MboxCoroutineState::Yielded(MboxYield::WantsDirCanonical(path)) => {
+                    let path = canonical.get(path.as_str()).copied();
+                    arg = Some(MboxReply::DirCanonical(path.map(MboxFsPath::new)));
+                }
+                MboxCoroutineState::Yielded(MboxYield::WantsDirRead(path)) => {
+                    arg = Some(dirs[path.as_str()].clone());
+                    read.push(path);
+                }
+                state => panic!("unexpected {state:?}"),
+            }
+        };
+
+        let read: Vec<&str> = read.iter().map(|path| path.as_str()).collect();
+        assert_eq!(read, ["/m", "/m/sub", "/m/far", "/m/far/deep"]);
+        let names: Vec<&str> = mboxes.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names, ["a", "far/c", "far/deep/d", "sub/b"]);
+    }
+
+    #[test]
     fn missing_inbox_and_bad_replies() {
         let store = MboxStore {
             root: MboxFsPath::new("/m"),
@@ -207,6 +325,7 @@ mod tests {
         };
         let mut cor = MboxList::new(store);
         cor.resume(None);
+        cor.resume(Some(MboxReply::DirCanonical(None)));
         cor.resume(Some(dir(&[("/m/in", MboxFileKind::File)])));
         let MboxCoroutineState::Complete(Ok(mboxes)) = cor.resume(Some(MboxReply::FileMeta(None)))
         else {
@@ -221,6 +340,7 @@ mod tests {
         ));
         cor = MboxList::new(MboxStore::default());
         cor.resume(None);
+        cor.resume(Some(MboxReply::DirCanonical(None)));
         assert!(matches!(
             cor.resume(Some(dir(&[]))),
             MboxCoroutineState::Complete(Ok(_))

@@ -35,16 +35,21 @@ pub struct MboxStore {
 }
 
 impl MboxStore {
-    /// Resolves a logical mailbox name to its on-disk path.
+    /// Resolves a logical mailbox name to its on-disk path, `None` for a
+    /// name [`MboxPath::names_mbox`] rejects, which would leave the root.
     ///
     /// `INBOX` (any case) resolves to [`Self::inbox`] when set. Otherwise
     /// `a/b` resolves to `<root>/a/b`, or `<root>/a.sbd/b` in the
     /// Thunderbird layout.
-    pub fn resolve(&self, name: &MboxPath) -> MboxFsPath {
+    pub fn resolve(&self, name: &MboxPath) -> Option<MboxFsPath> {
         if let Some(inbox) = &self.inbox
             && name.as_str().eq_ignore_ascii_case(INBOX)
         {
-            return inbox.clone();
+            return Some(inbox.clone());
+        }
+
+        if !name.names_mbox() {
+            return None;
         }
 
         let mut rel = String::new();
@@ -59,7 +64,7 @@ impl MboxStore {
             }
         }
 
-        self.root.join(&rel)
+        Some(self.root.join(&rel))
     }
 
     /// Reverse of [`Self::resolve`]: the logical name of an on-disk path,
@@ -110,8 +115,17 @@ mod tests {
     fn inbox_resolves_to_the_spool() {
         let store = store(false);
         let spool = MboxFsPath::new("/var/mail/me");
-        assert_eq!(store.resolve(&MboxPath::from("inbox")), spool);
+        assert_eq!(store.resolve(&MboxPath::from("inbox")), Some(spool.clone()));
         assert_eq!(store.relative(&spool), Some(MboxPath::from("INBOX")));
+    }
+
+    #[test]
+    fn a_name_leaving_the_root_does_not_resolve() {
+        for store in [store(false), store(true)] {
+            for name in ["", ".", "..", "../x", "a/../../x", "a/./b", "a\0"] {
+                assert_eq!(store.resolve(&MboxPath::from(name)), None, "{name:?}");
+            }
+        }
     }
 
     #[test]
@@ -120,14 +134,14 @@ mod tests {
             inbox: None,
             ..store(false)
         };
-        let path = store.resolve(&MboxPath::from("INBOX"));
+        let path = store.resolve(&MboxPath::from("INBOX")).unwrap();
         assert_eq!(path.as_str(), "/mail/INBOX");
     }
 
     #[test]
     fn plain_layout_round_trips() {
         let store = store(false);
-        let path = store.resolve(&MboxPath::from("lists/rust"));
+        let path = store.resolve(&MboxPath::from("lists/rust")).unwrap();
         assert_eq!(path.as_str(), "/mail/lists/rust");
         assert_eq!(store.relative(&path), Some(MboxPath::from("lists/rust")));
     }
@@ -135,7 +149,7 @@ mod tests {
     #[test]
     fn thunderbird_layout_round_trips() {
         let store = store(true);
-        let path = store.resolve(&MboxPath::from("a/b/c"));
+        let path = store.resolve(&MboxPath::from("a/b/c")).unwrap();
         assert_eq!(path.as_str(), "/mail/a.sbd/b.sbd/c");
         assert_eq!(store.relative(&path), Some(MboxPath::from("a/b/c")));
     }

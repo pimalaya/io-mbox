@@ -36,6 +36,10 @@ The crate SHALL read mboxo, mboxrd, mboxcl and mboxcl2, and write any of them, m
 
 Flags SHALL be read from `Status` (`R` seen, `O` old), `X-Status` (`A` answered, `F` flagged, `T` draft, `D` deleted) and `X-Keywords` (keywords separated by spaces or commas). A message carrying none of them SHALL have its flags read from `X-Mozilla-Status` and `X-Mozilla-Keys`. Flags SHALL be written as `Status`, `X-Status` and `X-Keywords`, each omitted when empty. A flag write on a message carrying an `X-Mozilla-Status` of four hex digits SHALL also set its read (`0x0001`), replied (`0x0002`), marked (`0x0004`) and expunged (`0x0008`) bits from the flags, in place, its other bits kept, so Thunderbird, which reads that field first, agrees. A flag write on a message carrying `X-Mozilla-Keys` SHALL write that field again after the flag fields, from the keywords, so Thunderbird keeps the labels Himalaya sets or drops. No Thunderbird field is ever added to a message lacking it.
 
+### Requirement: A keyword reads back as written
+
+A keyword SHALL be accepted only when it is not empty, is 255 bytes long at most, has no whitespace at either end and holds no ASCII whitespace, comma or control character, so no flag set can hold one an `X-Keywords` field would split, cut or let end the header. A token of `X-Keywords` or `X-Mozilla-Keys` that is no such keyword SHALL be left out when flags are read. A keyword SHALL be checked again when deserialized.
+
 ### Requirement: The pseudo message is metadata
 
 A message carrying an `X-IMAP` field is the c-client folder metadata message. It SHALL be marked on its entry so clients hide it, and SHALL be preserved by rewrites like any other message.

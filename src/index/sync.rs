@@ -6,7 +6,7 @@
 //! use io_mbox::{client::MboxClient, index::sync::*};
 //!
 //! let client = MboxClient::new("/path/to/mail");
-//! let path = client.store.resolve(&"archive".into());
+//! let path = client.store.resolve(&"archive".into()).unwrap();
 //! let coroutine = MboxIndexSync::new(path, None, Default::default());
 //! let output = client.run(coroutine).unwrap();
 //!

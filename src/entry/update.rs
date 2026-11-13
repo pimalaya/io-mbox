@@ -804,7 +804,11 @@ mod tests {
     use alloc::{collections::BTreeMap, string::String, vec::Vec};
 
     use crate::{
-        coroutine::*, entry::update::*, flag::MboxFlag, lock::MboxLockOptions, path::MboxFsPath,
+        coroutine::*,
+        entry::update::*,
+        flag::{MboxFlag, MboxKeyword},
+        lock::MboxLockOptions,
+        path::MboxFsPath,
         scan::MboxScanner,
     };
 
@@ -942,6 +946,10 @@ body three
         MboxEntryUpdateEdit::Flags(list.iter().cloned().collect())
     }
 
+    fn keyword(keyword: &str) -> MboxFlag {
+        MboxFlag::Keyword(MboxKeyword::new(keyword).unwrap())
+    }
+
     #[test]
     fn rewrites_flags_in_place() {
         let entries = scan(MBOX);
@@ -954,7 +962,7 @@ body three
                 ),
                 (
                     entries[1].id.clone(),
-                    flags(&[MboxFlag::Flagged, MboxFlag::Keyword("k".into())]),
+                    flags(&[MboxFlag::Flagged, keyword("k")]),
                 ),
             ]);
             let out = fs.run(edits, chunk).unwrap();
@@ -1126,7 +1134,7 @@ body three
         assert!(entries[0].mozilla_keys);
 
         let mut fs = memfs(mbox);
-        let keyword = MboxFlag::Keyword("todo".into());
+        let keyword = keyword("todo");
         let edits = BTreeMap::from([(entries[0].id.clone(), flags(&[MboxFlag::Seen, keyword]))]);
         let out = fs.run(edits, 5).unwrap();
 

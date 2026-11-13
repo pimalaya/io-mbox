@@ -49,6 +49,9 @@ pub enum MboxYield {
     /// List the direct entries of a directory, answered by
     /// [`MboxReply::DirRead`]. A missing directory lists empty.
     WantsDirRead(MboxFsPath),
+    /// Resolve a directory to its canonical path, every symbolic link
+    /// followed, answered by [`MboxReply::DirCanonical`].
+    WantsDirCanonical(MboxFsPath),
     /// Create a directory and its parents, answered by
     /// [`MboxReply::DirCreate`].
     WantsDirCreate(MboxFsPath),
@@ -124,6 +127,9 @@ pub enum MboxYield {
 pub enum MboxReply {
     /// Answer to [`MboxYield::WantsDirRead`]: every entry with its kind.
     DirRead(BTreeMap<MboxFsPath, MboxFileKind>),
+    /// Answer to [`MboxYield::WantsDirCanonical`], `None` for a path
+    /// that does not resolve.
+    DirCanonical(Option<MboxFsPath>),
     /// Acknowledgement of [`MboxYield::WantsDirCreate`].
     DirCreate,
     /// Answer to [`MboxYield::WantsFileMeta`], `None` for a missing file.
@@ -169,10 +175,12 @@ pub enum MboxReply {
 /// Kind of a directory entry.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum MboxFileKind {
-    /// A regular file.
+    /// A regular file, or a symbolic link to one.
     File,
     /// A directory.
     Dir,
+    /// A symbolic link to a directory.
+    DirLink,
     /// Anything else (symlink target missing, socket, device).
     Other,
 }

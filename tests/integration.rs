@@ -22,7 +22,7 @@ use io_mbox::{
     client::{MboxClient, MboxClientError},
     entry::append::MboxEntryAppendError,
     entry::{append::MboxEntryAppendItem, update::MboxEntryUpdateEdit},
-    flag::{MboxFlag, MboxFlags},
+    flag::{MboxFlag, MboxFlags, MboxKeyword},
     index::sync::MboxIndexSyncOutcome,
     lock::{MboxLockOptions, acquire::MboxLockAcquireError},
 };
@@ -189,6 +189,75 @@ fn a_move_keeps_a_message_whose_sender_no_from_line_can_carry() {
     assert_eq!(target.entries[0].sender, "MAILER-DAEMON");
     let message = client.get("target", target.entries[0].clone()).unwrap();
     assert_eq!(message.contents, b"Subject: long\n\nbody\n");
+}
+
+#[test]
+fn a_name_leaving_the_root_is_refused() {
+    let tmp = tempdir().unwrap();
+    let client = client(&tmp);
+    client.create_mbox("inside").unwrap();
+    let inside = tmp.path().join("mail/inside");
+    let outside = tmp.path().join("notes");
+    let notes = b"From a@b Mon Jan  1 00:00:00 2024\n\nx\n";
+    fs::write(&outside, notes).unwrap();
+
+    fn refused<T>(result: Result<T, MboxClientError>) -> bool {
+        matches!(result, Err(MboxClientError::InvalidName(_)))
+    }
+
+    for name in [
+        "../notes",
+        "inside/../../notes",
+        "./inside",
+        "inside/.",
+        "..",
+        ".",
+        "",
+        "in\0side",
+    ] {
+        assert!(refused(client.delete_mbox(name)), "{name:?}");
+        assert!(refused(client.rename_mbox(name, "renamed")), "{name:?}");
+        assert!(refused(client.rename_mbox("inside", name)), "{name:?}");
+        assert!(refused(client.create_mbox(name)), "{name:?}");
+        assert!(refused(client.append(name, vec![item("x")])), "{name:?}");
+        assert!(
+            refused(client.update(name, BTreeMap::new(), None)),
+            "{name:?}"
+        );
+        assert!(refused(client.copy("inside", name, Vec::new())), "{name:?}");
+        assert!(refused(client.sync_index(name, None)), "{name:?}");
+    }
+
+    assert!(inside.exists());
+    assert_eq!(fs::read(&outside).unwrap(), notes);
+    let left: Vec<_> = fs::read_dir(tmp.path()).unwrap().collect();
+    assert_eq!(left.len(), 2, "nothing created beside the root");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_listing_walks_each_directory_once() {
+    let tmp = tempdir().unwrap();
+    let client = client(&tmp);
+    let root = tmp.path().join("mail");
+    client.create_mbox("a").unwrap();
+    client.create_mbox("sub/b").unwrap();
+    fs::create_dir(tmp.path().join("far")).unwrap();
+    fs::write(tmp.path().join("far/c"), b"").unwrap();
+
+    std::os::unix::fs::symlink(&root, root.join("sub/up")).unwrap();
+    std::os::unix::fs::symlink(&root, root.join("again")).unwrap();
+    std::os::unix::fs::symlink(root.join("sub"), root.join("twin")).unwrap();
+    std::os::unix::fs::symlink(tmp.path().join("far"), root.join("far")).unwrap();
+    std::os::unix::fs::symlink(root.join("a"), root.join("alias")).unwrap();
+
+    let names: Vec<String> = client
+        .list_mboxes()
+        .unwrap()
+        .into_iter()
+        .map(|m| m.name.to_string())
+        .collect();
+    assert_eq!(names, ["a", "alias", "far/c", "sub/b"]);
 }
 
 #[test]
@@ -364,7 +433,8 @@ fn concurrent_delivery_is_never_lost() {
                 removed += 1;
             } else if i % 3 == round % 3 {
                 let mut flags = entry.flags.clone();
-                flags.insert(MboxFlag::Keyword(format!("r{round}")));
+                let keyword = MboxKeyword::new(format!("r{round}")).unwrap();
+                flags.insert(MboxFlag::Keyword(keyword));
                 edits.insert(entry.id.clone(), MboxEntryUpdateEdit::Flags(flags));
             }
         }

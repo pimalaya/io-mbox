@@ -40,7 +40,7 @@ use std::{
 use io_mbox::{
     client::MboxClient,
     entry::{MboxEntry, append::MboxEntryAppendItem, update::MboxEntryUpdateEdit},
-    flag::MboxFlag,
+    flag::{MboxFlag, MboxKeyword},
     format::MboxFormat,
     index::sync::MboxIndexSyncOutcome,
     lock::MboxLockOptions,
@@ -221,7 +221,8 @@ fn check(path: &Path) {
         .map(|entry| {
             let mut flags = entry.flags.clone();
             flags.insert(MboxFlag::Flagged);
-            flags.insert(MboxFlag::Keyword("io-mbox".into()));
+            let keyword = MboxKeyword::new("io-mbox").unwrap();
+            flags.insert(MboxFlag::Keyword(keyword));
             (entry.id.clone(), MboxEntryUpdateEdit::Flags(flags))
         })
         .collect();

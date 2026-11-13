@@ -39,3 +39,17 @@ A copy SHALL read each message and append it to the target with its flags, sende
 ### Requirement: Mailbox lifecycle
 
 Creating a mailbox SHALL create an empty file and its parent directories, and fail when a file exists. Renaming SHALL refuse a missing source or an existing target. Deleting SHALL remove the file under lock. Renaming and deleting SHALL remove the source's Thunderbird summary (`<file>.msf`), which Thunderbird rebuilds. Listing SHALL walk the root recursively, skip hidden files and `.lock`, `.msf` and `.lck` files, map Thunderbird `.sbd` directories to child names when the store says so, and list the spool as `INBOX` when it exists.
+
+### Requirement: A name stays below the root
+
+A mailbox name SHALL resolve to a path only when it has one segment at least, none of them `.` or `..`, and holds no NUL. Any other name SHALL be refused by every operation taking a name, before any filesystem request. `INBOX` SHALL still resolve to the spool wherever it lives.
+
+### Requirement: A listing walks each directory once
+
+The driver SHALL report a symbolic link to a directory as such in a directory read, a link to a file counting as a file, and SHALL give the canonical path of a directory when asked. The listing SHALL track the canonical path of every directory it reaches, read the directories below the root first, then follow a link to a directory only when it leads to one not reached yet. A directory is so listed under its own name rather than a link's, and a link back into the tree is not followed.
+
+#### Scenario: A link back to the root
+
+- GIVEN a root holding a mailbox and, in a subdirectory, a link to the root itself
+- WHEN the mailboxes are listed
+- THEN the mailbox is listed once, under its own name

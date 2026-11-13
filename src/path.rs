@@ -154,6 +154,15 @@ impl MboxPath {
     pub fn components(&self) -> impl Iterator<Item = &str> {
         self.0.split('/').filter(|c| !c.is_empty())
     }
+
+    /// Returns `true` when the name can stand for a file below a store
+    /// root: one segment at least, none of them `.` or `..`, and no NUL.
+    pub fn names_mbox(&self) -> bool {
+        let mut components = self.components().peekable();
+        components.peek().is_some()
+            && !self.0.contains('\0')
+            && components.all(|c| c != "." && c != "..")
+    }
 }
 
 impl fmt::Display for MboxPath {
@@ -232,5 +241,15 @@ mod tests {
         let parts: Vec<&str> = path.components().collect();
         assert_eq!(parts, ["lists", "rust"]);
         assert!(MboxPath::from("//").is_empty());
+    }
+
+    #[test]
+    fn only_a_name_below_the_root_names_an_mbox() {
+        for name in ["a", "/lists//rust/", "...", "a..b", ".hidden"] {
+            assert!(MboxPath::from(name).names_mbox(), "{name}");
+        }
+        for name in ["", "/", ".", "..", "a/./b", "a/../b", "../a", "a\0b"] {
+            assert!(!MboxPath::from(name).names_mbox(), "{name:?}");
+        }
     }
 }

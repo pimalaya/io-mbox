@@ -93,6 +93,10 @@ pub enum MboxClientError {
     /// The mbox rename coroutine failed.
     #[error(transparent)]
     Rename(#[from] MboxRenameError),
+    /// The name is empty, or holds a `.` or `..` segment or a NUL, so it
+    /// stands for no file below the root.
+    #[error("Mbox name {0:?} is invalid: empty, or holding a `.` or `..` segment or a NUL")]
+    InvalidName(String),
     /// No message has this id.
     #[error("Mbox message {0} not found")]
     MessageNotFound(String),
@@ -197,8 +201,10 @@ impl MboxClient {
         }
     }
 
-    fn path(&self, name: impl Into<MboxPath>) -> MboxFsPath {
-        self.store.resolve(&name.into())
+    fn path(&self, name: impl Into<MboxPath>) -> Result<MboxFsPath, MboxClientError> {
+        let name = name.into();
+        let path = self.store.resolve(&name);
+        path.ok_or_else(|| MboxClientError::InvalidName(name.to_string()))
     }
 
     /// Lists the mailboxes of the store.
@@ -218,12 +224,12 @@ impl MboxClient {
 
     /// Creates the empty mailbox `name`.
     pub fn create_mbox(&self, name: impl Into<MboxPath>) -> Result<(), MboxClientError> {
-        self.run(MboxCreate::new(self.path(name)))
+        self.run(MboxCreate::new(self.path(name)?))
     }
 
     /// Deletes the mailbox `name`, under lock.
     pub fn delete_mbox(&self, name: impl Into<MboxPath>) -> Result<(), MboxClientError> {
-        self.run(MboxDelete::new(self.path(name), self.lock.clone()))
+        self.run(MboxDelete::new(self.path(name)?, self.lock.clone()))
     }
 
     /// Renames the mailbox `from` to `to`.
@@ -232,7 +238,7 @@ impl MboxClient {
         from: impl Into<MboxPath>,
         to: impl Into<MboxPath>,
     ) -> Result<(), MboxClientError> {
-        self.run(MboxRename::new(self.path(from), self.path(to)))
+        self.run(MboxRename::new(self.path(from)?, self.path(to)?))
     }
 
     /// Brings `index`, if any, up to date with the mailbox `name`.
@@ -245,7 +251,7 @@ impl MboxClient {
             scanner: self.scanner.clone(),
             chunk_size: self.chunk_size,
         };
-        self.run(MboxIndexSync::new(self.path(name), index, opts))
+        self.run(MboxIndexSync::new(self.path(name)?, index, opts))
     }
 
     /// Reads the message of `entry` in the mailbox `name`.
@@ -259,7 +265,7 @@ impl MboxClient {
             scanner: self.scanner.clone(),
             chunk_size: self.chunk_size,
         };
-        self.run(MboxEntryGet::new(self.path(name), entry, opts))
+        self.run(MboxEntryGet::new(self.path(name)?, entry, opts))
     }
 
     /// Reads the message `id` of the mailbox `name`, syncing `index`
@@ -290,7 +296,7 @@ impl MboxClient {
             lock: self.lock.clone(),
             scanner: self.scanner.clone(),
         };
-        self.run(MboxEntryAppend::new(self.path(name), items, opts))
+        self.run(MboxEntryAppend::new(self.path(name)?, items, opts))
     }
 
     /// Rewrites flags and removes messages of the mailbox `name`, under
@@ -307,7 +313,7 @@ impl MboxClient {
             scanner: self.scanner.clone(),
             chunk_size: self.chunk_size,
         };
-        self.run(MboxEntryUpdate::new(self.path(name), edits, opts))
+        self.run(MboxEntryUpdate::new(self.path(name)?, edits, opts))
     }
 
     /// Copies `entries` of the mailbox `from` to the end of `to`.
@@ -324,8 +330,8 @@ impl MboxClient {
             chunk_size: self.chunk_size,
         };
         self.run(MboxEntryCopy::new(
-            self.path(from),
-            self.path(to),
+            self.path(from)?,
+            self.path(to)?,
             entries,
             opts,
         ))
@@ -347,8 +353,8 @@ impl MboxClient {
             chunk_size: self.chunk_size,
         };
         self.run(MboxEntryMove::new(
-            self.path(from),
-            self.path(to),
+            self.path(from)?,
+            self.path(to)?,
             entries,
             opts,
         ))
@@ -381,9 +387,12 @@ impl Run {
                 match fs::read_dir(path.as_str()) {
                     Ok(iter) => {
                         for entry in iter {
-                            let entry_path = entry?.path();
+                            let entry = entry?;
+                            let entry_path = entry.path();
+                            let link = entry.file_type().is_ok_and(|kind| kind.is_symlink());
                             let kind = match fs::metadata(&entry_path) {
                                 Ok(meta) if meta.is_file() => MboxFileKind::File,
+                                Ok(meta) if meta.is_dir() && link => MboxFileKind::DirLink,
                                 Ok(meta) if meta.is_dir() => MboxFileKind::Dir,
                                 _ => MboxFileKind::Other,
                             };
@@ -394,6 +403,11 @@ impl Run {
                     Err(err) => return Err(err.into()),
                 }
                 MboxReply::DirRead(entries)
+            }
+            MboxYield::WantsDirCanonical(path) => {
+                let canonical = fs::canonicalize(path.as_str()).ok();
+                trace!("canonicalize {path}: {canonical:?}");
+                MboxReply::DirCanonical(canonical.map(MboxFsPath::from))
             }
             MboxYield::WantsDirCreate(path) => {
                 trace!("create dir {path}");
