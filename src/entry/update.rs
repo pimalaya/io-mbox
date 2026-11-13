@@ -15,8 +15,12 @@
 //! copying back leaves it in place: it then holds the only intact copy
 //! of the tail, which the std client names in its error.
 //!
-//! Flag fields are located by [`crate::entry::MboxEntry::flag_spans`], so
-//! no message is parsed again, and content ids do not change.
+//! A sync that resumes or reuses the index does not see a rewrite in
+//! place. So unless the sync scanned the whole file, every message to
+//! edit is scanned again, as a read does: its flags and the place of its
+//! flag fields ([`crate::entry::MboxEntry::flag_spans`]) come from that
+//! scan, and a message the file no longer holds there fails the update as
+//! stale before anything is written. Content ids do not change.
 //!
 //! # Example
 //!
@@ -52,14 +56,17 @@ use crate::{
     flag::MboxFlags,
     index::{
         MboxIndex,
-        sync::{CHUNK_SIZE, MboxIndexSync, MboxIndexSyncError, MboxIndexSyncOptions},
+        sync::{
+            CHUNK_SIZE, MboxIndexSync, MboxIndexSyncError, MboxIndexSyncOptions,
+            MboxIndexSyncOutcome,
+        },
         tail_hash, tail_range,
     },
     lock::{MboxLock, MboxLockOptions, acquire::*, release::*},
     mbox_try,
     path::MboxFsPath,
     range::{MboxRange, MboxRangeCopy, MboxRangeCopyError},
-    scan::MboxScannerOptions,
+    scan::{MboxScanner, MboxScannerOptions},
 };
 
 /// Failure causes of a [`MboxEntryUpdate`] step.
@@ -74,6 +81,9 @@ pub enum MboxEntryUpdateError {
     /// No message has this id.
     #[error("Mbox message update failed: message {0} not found")]
     MessageNotFound(String),
+    /// The file no longer holds the message where the index says.
+    #[error("Mbox message update failed: message {0} moved, rebuild the index and retry")]
+    Stale(String),
     /// The locks could not be taken.
     #[error(transparent)]
     Lock(#[from] MboxLockAcquireError),
@@ -130,6 +140,8 @@ pub struct MboxEntryUpdate {
     opts: MboxEntryUpdateOptions,
     lock: Option<MboxLock>,
     index: MboxIndex,
+    /// The edits by position in the synced index.
+    located: BTreeMap<usize, MboxEntryUpdateEdit>,
     plan: Plan,
     temp: Option<MboxFsPath>,
     /// Whether the temporary file started to be copied back, after which
@@ -153,6 +165,7 @@ impl MboxEntryUpdate {
             opts,
             lock: None,
             index: MboxIndex::default(),
+            located: BTreeMap::new(),
             plan: Plan::default(),
             temp: None,
             copying_back: false,
@@ -193,24 +206,117 @@ impl MboxEntryUpdate {
         self.resume(None)
     }
 
-    /// Plans the rewrite once the index is synced and the last byte of the
-    /// file is known.
+    /// Starts scanning again the first entry to edit from `pos` on, or
+    /// reads the last byte of the file once they all hold.
+    fn rescan_from(
+        &mut self,
+        pos: usize,
+    ) -> MboxCoroutineState<MboxYield, <Self as MboxCoroutine>::Return> {
+        if let Some((&pos, _)) = self.located.range(pos..).next() {
+            let offset = self.index.entries[pos].offset;
+            let scanner = MboxScanner::new(offset, self.opts.scanner.clone());
+            self.state = State::Rescan {
+                pos,
+                scanner: Box::new(scanner),
+                entries: Vec::new(),
+            };
+            return self.rescan(None);
+        }
+
+        self.read_last_byte()
+    }
+
+    /// Reads the last byte of the file, which the plan needs.
+    fn read_last_byte(&mut self) -> MboxCoroutineState<MboxYield, <Self as MboxCoroutine>::Return> {
+        let size = self.index.meta.size;
+        if size == 0 {
+            return self.plan(true);
+        }
+
+        self.state = State::LastByte;
+        MboxCoroutineState::Yielded(MboxYield::WantsFileRead {
+            path: self.path.clone(),
+            offset: size - 1,
+            len: 1,
+        })
+    }
+
+    /// Scans an entry to edit again, separator included, and swaps it for
+    /// what the file holds when it still is the same message.
+    fn rescan(
+        &mut self,
+        bytes: Option<Vec<u8>>,
+    ) -> MboxCoroutineState<MboxYield, <Self as MboxCoroutine>::Return> {
+        let chunk_size = self.chunk_size();
+        let State::Rescan {
+            pos,
+            scanner,
+            entries,
+        } = &mut self.state
+        else {
+            return self.finish(Err(MboxEntryUpdateError::UnexpectedArg(None)));
+        };
+        let pos = *pos;
+        let end = self.index.next_offset(pos);
+
+        let eof = match bytes {
+            Some(bytes) if bytes.is_empty() => true,
+            Some(mut bytes) => {
+                let left = end.saturating_sub(scanner.offset());
+                bytes.truncate(left.min(bytes.len() as u64) as usize);
+                entries.extend(scanner.feed(&bytes));
+                false
+            }
+            None => false,
+        };
+
+        let offset = scanner.offset();
+        if !eof && offset < end {
+            let len = (end - offset).min(chunk_size as u64) as usize;
+            return MboxCoroutineState::Yielded(MboxYield::WantsFileRead {
+                path: self.path.clone(),
+                offset,
+                len,
+            });
+        }
+
+        let scanner = mem::replace(scanner, Box::new(MboxScanner::new(0, Default::default())));
+        let mut entries = mem::take(entries);
+        entries.extend(scanner.finish());
+
+        let entry = &mut self.index.entries[pos];
+        let hash = entry.id.split('-').next().unwrap_or_default();
+        let fresh = match <[MboxEntry; 1]>::try_from(entries) {
+            Ok([fresh])
+                if offset == end
+                    && fresh.offset == entry.offset
+                    && fresh.id == hash
+                    && fresh.len == entry.len =>
+            {
+                fresh
+            }
+            _ => {
+                let err = MboxEntryUpdateError::Stale(entry.id.clone());
+                return self.finish(Err(err));
+            }
+        };
+
+        let id = mem::take(&mut entry.id);
+        *entry = MboxEntry { id, ..fresh };
+        self.rescan_from(pos + 1)
+    }
+
+    /// Plans the rewrite once the entries to edit hold and the last byte
+    /// of the file is known.
     fn plan(
         &mut self,
         ends_with_newline: bool,
     ) -> MboxCoroutineState<MboxYield, <Self as MboxCoroutine>::Return> {
-        let mut edits = BTreeMap::new();
-        for (id, edit) in mem::take(&mut self.edits) {
-            let Some(pos) = self.index.entries.iter().position(|entry| entry.id == id) else {
-                return self.finish(Err(MboxEntryUpdateError::MessageNotFound(id)));
-            };
-            if let MboxEntryUpdateEdit::Flags(flags) = &edit
-                && *flags == self.index.entries[pos].flags
-            {
-                continue;
-            }
-            edits.insert(pos, edit);
-        }
+        let mut edits = mem::take(&mut self.located);
+        edits.retain(|pos, edit| match edit {
+            MboxEntryUpdateEdit::Flags(flags) => *flags != self.index.entries[*pos].flags,
+            MboxEntryUpdateEdit::Remove => true,
+        });
 
         let Some(first) = edits.keys().next().copied() else {
             debug!("mbox already up to date");
@@ -303,17 +409,23 @@ impl MboxCoroutine for MboxEntryUpdate {
                     MboxCoroutineState::Complete(Ok(output)) => output,
                 };
                 self.index = output.index;
-                let size = self.index.meta.size;
-                if size == 0 {
-                    return self.plan(true);
+
+                for (id, edit) in mem::take(&mut self.edits) {
+                    let entries = &self.index.entries;
+                    let Some(pos) = entries.iter().position(|entry| entry.id == id) else {
+                        return self.finish(Err(MboxEntryUpdateError::MessageNotFound(id)));
+                    };
+                    self.located.insert(pos, edit);
                 }
-                self.state = State::LastByte;
-                MboxCoroutineState::Yielded(MboxYield::WantsFileRead {
-                    path: self.path.clone(),
-                    offset: size - 1,
-                    len: 1,
-                })
+
+                // NOTE: entries scanned under this very lock are what the
+                // file holds, so a rebuilt index always goes through.
+                match output.outcome {
+                    MboxIndexSyncOutcome::Rebuilt => self.read_last_byte(),
+                    _ => self.rescan_from(0),
+                }
             }
+            (State::Rescan { .. }, Some(MboxReply::FileRead(bytes))) => self.rescan(Some(bytes)),
             (State::LastByte, Some(MboxReply::FileRead(bytes))) => {
                 let ends_with_newline = bytes.last() == Some(&b'\n');
                 self.plan(ends_with_newline)
@@ -642,6 +754,11 @@ enum State {
     Checking,
     Lock(MboxLockAcquire),
     Sync(Box<MboxIndexSync>),
+    Rescan {
+        pos: usize,
+        scanner: Box<MboxScanner>,
+        entries: Vec<MboxEntry>,
+    },
     LastByte,
     Temp,
     Fill(Option<MboxRangeCopy>),
@@ -664,6 +781,7 @@ impl fmt::Display for State {
             Self::Checking => f.write_str("check mbox"),
             Self::Lock(_) => f.write_str("lock mbox"),
             Self::Sync(_) => f.write_str("sync index"),
+            Self::Rescan { .. } => f.write_str("scan entry"),
             Self::LastByte => f.write_str("read last byte"),
             Self::Temp => f.write_str("create temp"),
             Self::Fill(_) => f.write_str("fill temp"),
@@ -703,7 +821,17 @@ mod tests {
             edits: BTreeMap<String, MboxEntryUpdateEdit>,
             chunk: usize,
         ) -> Result<MboxEntryUpdateOutput, MboxEntryUpdateError> {
+            self.run_with(edits, None, chunk)
+        }
+
+        fn run_with(
+            &mut self,
+            edits: BTreeMap<String, MboxEntryUpdateEdit>,
+            index: Option<MboxIndex>,
+            chunk: usize,
+        ) -> Result<MboxEntryUpdateOutput, MboxEntryUpdateError> {
             let opts = MboxEntryUpdateOptions {
+                index,
                 lock: MboxLockOptions {
                     skip_dotlock: true,
                     skip_fcntl: true,
@@ -1018,6 +1146,70 @@ body three
             b"From - Mon Jan  1 00:00:00 2024\nX-Mozilla-Status: 0000\nSubject: one\nX-Mozilla-Keys:\n\nbody\n"
                 .as_slice()
         );
+    }
+
+    #[test]
+    fn a_flag_write_starts_from_the_flags_the_file_holds() {
+        let one = "From - Mon Jan  1 00:00:00 2024\nX-Mozilla-Status: 0000\nSubject: 1\n\nbody\n\n";
+        let two = format!(
+            "From - Mon Jan  1 00:00:00 2024\nSubject: 2\n\n{}\n\n",
+            "x".repeat(5000)
+        );
+        let three = "From - Mon Jan  1 00:00:00 2024\nSubject: 3\n\nbody\n";
+
+        let mut fs = memfs([one, two.as_str()].concat().as_bytes());
+        let index = fs.run(BTreeMap::new(), 4096).unwrap().index;
+        assert!(index.entries[0].flags.is_empty());
+
+        let read = one.replace("0000", "0001");
+        let grown = [read.as_str(), two.as_str(), three].concat();
+        fs.files.insert("mbox".into(), grown.clone().into_bytes());
+
+        let edits = BTreeMap::from([(index.entries[0].id.clone(), flags(&[]))]);
+        let out = fs.run_with(edits, Some(index), 4096).unwrap();
+        assert_eq!(out.updated, 1);
+        assert_eq!(
+            String::from_utf8_lossy(fs.mbox()),
+            grown.replace("0001", "0000")
+        );
+        assert_eq!(out.index.entries, scan(fs.mbox()));
+    }
+
+    #[test]
+    fn a_flag_write_cuts_the_fields_the_file_holds() {
+        let before =
+            b"From a@b Mon Jan  1 00:00:00 2024\nStatus: RO\nSubject: one\nX-Status: A\n\nbody\n";
+        let after =
+            b"From a@b Mon Jan  1 00:00:00 2024\nStatus: R\nSubject: one\nX-Status: AF\n\nbody\n";
+
+        let mut fs = memfs(before);
+        let index = fs.run(BTreeMap::new(), 4096).unwrap().index;
+        fs.files.insert("mbox".into(), after.to_vec());
+
+        let edits = BTreeMap::from([(index.entries[0].id.clone(), flags(&[MboxFlag::Seen]))]);
+        let out = fs.run_with(edits, Some(index), 4096).unwrap();
+        assert_eq!(
+            fs.mbox(),
+            b"From a@b Mon Jan  1 00:00:00 2024\nSubject: one\nStatus: R\n\nbody\n".as_slice()
+        );
+        assert_eq!(out.index.entries, scan(fs.mbox()));
+    }
+
+    #[test]
+    fn an_entry_the_file_no_longer_holds_is_stale() {
+        let mut fs = memfs(MBOX);
+        let index = fs.run(BTreeMap::new(), 4096).unwrap().index;
+        let rewritten = String::from_utf8_lossy(MBOX).replace("body one", "body eno");
+        fs.files
+            .insert("mbox".into(), rewritten.clone().into_bytes());
+
+        for edit in [MboxEntryUpdateEdit::Remove, flags(&[MboxFlag::Seen])] {
+            let edits = BTreeMap::from([(index.entries[0].id.clone(), edit)]);
+            let result = fs.run_with(edits, Some(index.clone()), 3);
+            assert!(matches!(result, Err(MboxEntryUpdateError::Stale(_))));
+            assert_eq!(String::from_utf8_lossy(fs.mbox()), rewritten);
+            assert_eq!(fs.files.len(), 1, "no temp file left");
+        }
     }
 
     #[test]

@@ -20,6 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Deleting or renaming an mbox removes its Thunderbird `.msf` summary.
 - A flag write keeps an existing `X-Mozilla-Keys` in step with the keywords, where a set left the labels Thunderbird reads in place.
 - `MboxClient::list_mboxes` leaves out a spool that is a directory.
+- An append fails before the write when a message would not read back as one entry (`MboxEntryAppendError::Unreadable`).
+- A flag write or a removal given an index scans each message to edit again, and fails before the write when the file no longer holds it (`MboxEntryUpdateError::Stale`).
 
 ### Fixed
 
@@ -28,6 +30,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A `Content-Length` declared inside four unchecked `Content-Length` ranges is ignored, so a line is scanned five times at most however deep a message nests them.
 - A `Content-Length` too large for a file offset is ignored instead of overflowing.
 - An index sync on a 32-bit target no longer stops early when a multiple of 4 GiB is left to scan.
+- `MboxFromLine::format` no longer writes a line that does not read back: a sender too long for the line becomes `MAILER-DAEMON`, the year takes four digits and the date stays within the years 0000 to 9999.
+- A flag write starts from the flags and flag fields the file holds, where a resumed or reused index could skip an edit or cut the wrong bytes.
 
 ## [0.1.0] - 2026-09-30
 

@@ -43,7 +43,7 @@ use crate::{
 
 /// Longest line kept whole. A longer line is streamed and can be neither
 /// a separator nor a blank line.
-const LINE_CAP: usize = 4096;
+pub(crate) const LINE_CAP: usize = 4096;
 
 /// Longest header kept in [`MboxEntry::header`].
 const HEADER_CAP: usize = 256 * 1024;

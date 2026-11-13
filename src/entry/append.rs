@@ -4,7 +4,9 @@
 //! line, then each message is written as a `From_` line, its header with
 //! the flag fields replaced (plus a `Content-Length` for the mboxcl
 //! variants), its quoted body and a separator. The whole batch goes out
-//! in one positioned write at the end of the file.
+//! in one positioned write at the end of the file, once it is scanned
+//! back: a message that would not read back as one entry, with the
+//! scanner options given, fails the append before the write.
 //!
 //! Messages are stored with LF line endings, as MTAs deliver them: a
 //! CRLF message is converted. Other readers do not take a CRLF `From_`
@@ -58,6 +60,9 @@ pub enum MboxEntryAppendError {
     /// The file is not empty and does not open on a `From_` line.
     #[error("Mbox message append failed: {0} is not an mbox, it does not open on a From_ line")]
     NotMbox(MboxFsPath),
+    /// The message at this index would not read back as one message.
+    #[error("Mbox message append failed: message {0} would not read back as one message")]
+    Unreadable(usize),
     /// The locks could not be taken.
     #[error(transparent)]
     Lock(#[from] MboxLockAcquireError),
@@ -170,13 +175,25 @@ impl MboxEntryAppend {
         }
         let pad = bytes.len();
 
+        let mut starts = Vec::with_capacity(self.items.len());
         for item in mem::take(&mut self.items) {
+            starts.push(self.size + bytes.len() as u64);
             bytes.extend(render(item, self.opts.format, now));
         }
 
         let mut scanner = MboxScanner::new(self.size + pad as u64, self.opts.scanner.clone());
         self.entries = scanner.feed(&bytes[pad..]);
         self.entries.extend(scanner.finish());
+
+        let mut offsets = self.entries.iter().map(|entry| entry.offset).peekable();
+        let unreadable = (0..starts.len()).find(|i| {
+            let next = starts.get(i + 1).copied().unwrap_or(u64::MAX);
+            let opened = offsets.next_if_eq(&starts[*i]).is_some();
+            !opened || offsets.peek().is_some_and(|offset| *offset < next)
+        });
+        if let Some(i) = unreadable {
+            return self.finish(Err(MboxEntryAppendError::Unreadable(i)));
+        }
 
         trace!("bytes: {}", bytes.len());
         self.state = State::Write;
@@ -520,6 +537,32 @@ From MAILER-DAEMON Thu Jan  1 00:00:00 1970\nSubject: y\n\nno newline\n\n"
 
         let mut file = b"\nFrom a@b Mon Jan  1 00:00:00 2024\n\nx\n".to_vec();
         assert!(run(&mut file, vec![item(b"Subject: x\n\nbody\n")], unlocked()).is_ok());
+    }
+
+    #[test]
+    fn a_sender_too_long_for_the_from_line_is_replaced() {
+        let mut file = Vec::new();
+        let contents = format!("From: <{}@b.c>\nSubject: x\n\nbody\n", "a".repeat(4096));
+        let entries = run(&mut file, vec![item(contents.as_bytes())], unlocked()).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].sender, "MAILER-DAEMON");
+        assert!(file.starts_with(b"From MAILER-DAEMON Thu Jan  1 00:00:00 1970\n"));
+    }
+
+    #[test]
+    fn a_message_that_does_not_read_back_as_one_is_refused() {
+        let opts = MboxEntryAppendOptions {
+            format: MboxFormat::MboxCl2,
+            ..unlocked()
+        };
+        let before = b"From a@b Mon Jan  1 00:00:00 2024\n\nx\n\n";
+        let one = item(b"Subject: x\n\nbody\n");
+        let two = item(b"Subject: y\n\nx\n\nFrom c@d Mon Jan  1 00:00:00 2024\ny\n");
+
+        let mut file = before.to_vec();
+        let result = run(&mut file, vec![one, two], opts);
+        assert!(matches!(result, Err(MboxEntryAppendError::Unreadable(1))));
+        assert_eq!(file, before);
     }
 
     #[test]

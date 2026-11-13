@@ -17,8 +17,16 @@
 
 use alloc::{string::String, vec::Vec};
 
+use crate::scan::LINE_CAP;
+
 /// How many bytes of a file [`MboxFromLine::opens_mbox`] is given.
 pub(crate) const HEAD_LEN: u64 = 1024;
+
+/// Longest sender of a formatted line the scanner still reads whole.
+const SENDER_CAP: usize = LINE_CAP - "From  Thu Jan  1 00:00:00 1970\n".len();
+
+/// First second of year 0000 and last of year 9999, UTC.
+const SECS_RANGE: (i64, i64) = (-62_167_219_200, 253_402_300_799);
 
 const DAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 const MONTHS: [&str; 12] = [
@@ -68,16 +76,17 @@ impl MboxFromLine {
     }
 
     /// Formats the line, LF-terminated, for `sender` delivered at `secs`
-    /// (UTC).
+    /// (UTC), so that it parses back and the scanner reads it whole.
     ///
-    /// An empty sender, or one containing whitespace, is replaced by
-    /// `MAILER-DAEMON` so the line parses back to a single token.
+    /// A sender that is empty, holds whitespace or is too long for the
+    /// line is replaced by `MAILER-DAEMON`, and a date outside the years
+    /// 0000 to 9999 is brought back to the nearest second inside.
     pub fn format(sender: &str, secs: i64) -> Vec<u8> {
-        let sender = if sender.is_empty() || sender.contains(|c: char| c.is_ascii_whitespace()) {
-            "MAILER-DAEMON"
-        } else {
-            sender
-        };
+        let unusable = sender.is_empty()
+            || sender.len() > SENDER_CAP
+            || sender.contains(|c: char| c.is_ascii_whitespace());
+        let sender = if unusable { "MAILER-DAEMON" } else { sender };
+        let secs = secs.clamp(SECS_RANGE.0, SECS_RANGE.1);
 
         let days = secs.div_euclid(86_400);
         let rem = secs.rem_euclid(86_400);
@@ -86,7 +95,7 @@ impl MboxFromLine {
         let month = MONTHS[(month - 1) as usize];
 
         let line = format!(
-            "From {sender} {weekday} {month} {day:>2} {:02}:{:02}:{:02} {year}\n",
+            "From {sender} {weekday} {month} {day:>2} {:02}:{:02}:{:02} {year:04}\n",
             rem / 3600,
             rem % 3600 / 60,
             rem % 60,
@@ -204,7 +213,7 @@ fn civil_from_days(z: i64) -> (i64, i64, i64) {
 
 #[cfg(test)]
 mod tests {
-    use crate::from_line::MboxFromLine;
+    use crate::{from_line::MboxFromLine, scan::LINE_CAP};
 
     fn parse(line: &str) -> Option<MboxFromLine> {
         MboxFromLine::parse(line.as_bytes())
@@ -310,5 +319,37 @@ mod tests {
         assert!(line.starts_with(b"From MAILER-DAEMON "));
         let line = MboxFromLine::format("a b", 0);
         assert!(line.starts_with(b"From MAILER-DAEMON "));
+    }
+
+    #[test]
+    fn format_replaces_a_sender_too_long_for_a_line() {
+        let longest = "a".repeat(4065);
+        let line = MboxFromLine::format(&longest, 0);
+        assert_eq!(line.len(), LINE_CAP);
+        assert_eq!(MboxFromLine::parse(&line).unwrap().sender, longest);
+
+        let line = MboxFromLine::format(&"a".repeat(4066), 0);
+        assert!(line.starts_with(b"From MAILER-DAEMON "));
+    }
+
+    #[test]
+    fn format_keeps_the_year_to_four_digits() {
+        const FIRST: i64 = -62_167_219_200;
+        const LAST: i64 = 253_402_300_799;
+
+        for (secs, kept) in [
+            (i64::MIN, FIRST),
+            (FIRST - 1, FIRST),
+            (FIRST, FIRST),
+            (-62_000_000_000, -62_000_000_000),
+            (-31_000_000_000, -31_000_000_000),
+            (LAST, LAST),
+            (LAST + 1, LAST),
+            (i64::MAX, LAST),
+        ] {
+            let line = MboxFromLine::format("a@b", secs);
+            let parsed = MboxFromLine::parse(&line);
+            assert_eq!(parsed.map(|from| from.timestamp), Some(kept), "{secs}");
+        }
     }
 }

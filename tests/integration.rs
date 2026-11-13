@@ -164,6 +164,34 @@ fn end_to_end() {
 }
 
 #[test]
+fn a_move_keeps_a_message_whose_sender_no_from_line_can_carry() {
+    let tmp = tempdir().unwrap();
+    let client = client(&tmp);
+    client.create_mbox("target").unwrap();
+
+    let source = format!(
+        "From {} Mon Jan 1 0:00 24\nSubject: long\n\nbody\n",
+        "a".repeat(4070)
+    );
+    fs::write(tmp.path().join("mail/source"), source).unwrap();
+    let index = client.sync_index("source", None).unwrap().index;
+    assert_eq!(index.entries.len(), 1);
+
+    let entries = index.entries.clone();
+    let moved = client
+        .r#move("source", "target", entries, Some(index))
+        .unwrap();
+    assert_eq!(moved.entries.len(), 1);
+    assert!(moved.index.entries.is_empty());
+
+    let target = client.sync_index("target", None).unwrap().index;
+    assert_eq!(target.entries, moved.entries);
+    assert_eq!(target.entries[0].sender, "MAILER-DAEMON");
+    let message = client.get("target", target.entries[0].clone()).unwrap();
+    assert_eq!(message.contents, b"Subject: long\n\nbody\n");
+}
+
+#[test]
 fn busy_dotlock_blocks_writers() {
     let tmp = tempdir().unwrap();
     let mut client = client(&tmp);
