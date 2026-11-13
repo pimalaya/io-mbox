@@ -17,6 +17,9 @@
 
 use alloc::{string::String, vec::Vec};
 
+/// How many bytes of a file [`MboxFromLine::opens_mbox`] is given.
+pub(crate) const HEAD_LEN: u64 = 1024;
+
 const DAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 const MONTHS: [&str; 12] = [
     "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
@@ -50,6 +53,18 @@ impl MboxFromLine {
         }
 
         None
+    }
+
+    /// Whether `head`, the first bytes of a file, opens an mbox: nothing
+    /// but blank lines, or a line starting with `From ` after them, as
+    /// mutt probes a file. Anything else is no mbox to list or append to.
+    pub fn opens_mbox(head: &[u8]) -> bool {
+        let start = head
+            .iter()
+            .position(|b| !matches!(b, b'\n' | b'\r' | b' ' | b'\t'))
+            .unwrap_or(head.len());
+        let head = &head[start..];
+        head.is_empty() || head.starts_with(b"From ")
     }
 
     /// Formats the line, LF-terminated, for `sender` delivered at `secs`
@@ -193,6 +208,23 @@ mod tests {
 
     fn parse(line: &str) -> Option<MboxFromLine> {
         MboxFromLine::parse(line.as_bytes())
+    }
+
+    #[test]
+    fn only_a_from_line_opens_an_mbox() {
+        assert!(MboxFromLine::opens_mbox(b""));
+        assert!(MboxFromLine::opens_mbox(b"\n\r\n"));
+        assert!(MboxFromLine::opens_mbox(
+            b"From a@b Mon Jan  1 00:00:00 2024\n"
+        ));
+        assert!(MboxFromLine::opens_mbox(
+            b"\nFrom - Mon Jan  1 00:00:00 2024\n"
+        ));
+        assert!(!MboxFromLine::opens_mbox(
+            b"root:x:0:0:root:/root:/bin/sh\n"
+        ));
+        assert!(!MboxFromLine::opens_mbox(b"Subject: hi\n\nFrom a@b\n"));
+        assert!(!MboxFromLine::opens_mbox(b"\x00\xff"));
     }
 
     #[test]

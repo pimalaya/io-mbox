@@ -44,8 +44,9 @@ use crate::{
     coroutine::*,
     entry::{MboxEntry, MboxFullEntry, append::*, copy::*, get::*, r#move::*, update::*},
     format::MboxFormat,
+    from_line::{HEAD_LEN, MboxFromLine},
     index::{MboxIndex, sync::*},
-    lock::MboxLockOptions,
+    lock::{MboxLockOptions, acquire::MboxLockAcquireError},
     mbox::{Mbox, create::*, delete::*, list::*, rename::*},
     path::{MboxFsPath, MboxPath},
     range::MboxRangeCopyError,
@@ -115,6 +116,31 @@ pub enum MboxClientError {
     Io(#[from] io::Error),
 }
 
+impl MboxClientError {
+    /// The lock another process held past the timeout, whichever write
+    /// wanted it, so a caller can tell a busy mbox, worth a retry, from
+    /// any other failure.
+    pub fn lock_busy(&self) -> Option<&MboxLockAcquireError> {
+        let lock = match self {
+            Self::EntryAppend(MboxEntryAppendError::Lock(err))
+            | Self::EntryUpdate(MboxEntryUpdateError::Lock(err))
+            | Self::EntryCopy(MboxEntryCopyError::Append(MboxEntryAppendError::Lock(err)))
+            | Self::EntryMove(MboxEntryMoveError::Copy(MboxEntryCopyError::Append(
+                MboxEntryAppendError::Lock(err),
+            )))
+            | Self::EntryMove(MboxEntryMoveError::Update(MboxEntryUpdateError::Lock(err)))
+            | Self::Delete(MboxDeleteError::Lock(err)) => err,
+            Self::Interrupted { source, .. } => return source.lock_busy(),
+            _ => return None,
+        };
+
+        match lock {
+            MboxLockAcquireError::DotlockBusy(_) | MboxLockAcquireError::FcntlBusy(_) => Some(lock),
+            MboxLockAcquireError::UnexpectedArg(_) => None,
+        }
+    }
+}
+
 /// Std-blocking mbox client.
 #[derive(Clone, Debug, Default)]
 pub struct MboxClient {
@@ -176,8 +202,18 @@ impl MboxClient {
     }
 
     /// Lists the mailboxes of the store.
+    ///
+    /// A file below the root that does not open on a `From_` line, as
+    /// [`MboxFromLine::opens_mbox`] tells, is no mailbox and is left out.
+    /// One that cannot be read is kept, and the spool is unless it is a
+    /// directory, which no read opens.
     pub fn list_mboxes(&self) -> Result<BTreeSet<Mbox>, MboxClientError> {
-        self.run(MboxList::new(self.store.clone()))
+        let mut mboxes = self.run(MboxList::new(self.store.clone()))?;
+        mboxes.retain(|mbox| match self.store.inbox.as_ref() == Some(&mbox.path) {
+            true => !fs::metadata(mbox.path.as_str()).is_ok_and(|meta| meta.is_dir()),
+            false => opens_mbox(&mbox.path),
+        });
+        Ok(mboxes)
     }
 
     /// Creates the empty mailbox `name`.
@@ -563,6 +599,19 @@ impl Run {
     }
 }
 
+/// Whether the file at `path` opens an mbox, `true` when it cannot be
+/// read.
+fn opens_mbox(path: &MboxFsPath) -> bool {
+    let Ok(file) = File::open(path.as_str()) else {
+        return true;
+    };
+    let mut head = Vec::with_capacity(HEAD_LEN as usize);
+    match file.take(HEAD_LEN).read_to_end(&mut head) {
+        Ok(_) => MboxFromLine::opens_mbox(&head),
+        Err(_) => true,
+    }
+}
+
 fn file_meta(meta: &fs::Metadata) -> MboxFileMeta {
     let (mtime_secs, mtime_nanos) = match meta.modified().map(|t| t.duration_since(UNIX_EPOCH)) {
         Ok(Ok(d)) => (d.as_secs() as i64, d.subsec_nanos()),
@@ -646,5 +695,69 @@ mod tests {
 
         let err = Run::default().abort(io::Error::other("disk full").into());
         assert!(matches!(err, MboxClientError::Io(_)));
+    }
+
+    #[test]
+    fn a_busy_lock_is_found_under_any_write() {
+        let busy = MboxLockAcquireError::FcntlBusy(MboxFsPath::new("a"));
+        let append = MboxEntryAppendError::Lock(busy.clone());
+        let errs = [
+            MboxClientError::EntryAppend(append.clone()),
+            MboxClientError::EntryMove(MboxEntryMoveError::Copy(MboxEntryCopyError::Append(
+                append,
+            ))),
+            MboxClientError::Interrupted {
+                source: Box::new(MboxClientError::Delete(MboxDeleteError::Lock(busy))),
+                temp: MboxFsPath::new("t"),
+            },
+        ];
+        for err in errs {
+            assert!(err.lock_busy().is_some(), "{err}");
+        }
+
+        let odd = MboxLockAcquireError::UnexpectedArg(None);
+        let err = MboxClientError::EntryAppend(MboxEntryAppendError::Lock(odd));
+        assert!(err.lock_busy().is_none());
+        assert!(
+            MboxClientError::MessageNotFound("x".into())
+                .lock_busy()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_listing_leaves_out_files_that_are_no_mbox() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(
+            root.join("mbox"),
+            b"From a@b Mon Jan  1 00:00:00 2024\n\nx\n",
+        )
+        .unwrap();
+        fs::write(root.join("empty"), b"").unwrap();
+        fs::write(root.join("README"), b"read me\n").unwrap();
+        fs::write(root.join("spool"), b"not yet").unwrap();
+
+        let mut client = MboxClient::new(root);
+        client.store.inbox = Some(MboxFsPath::from(root.join("spool")));
+        let names: Vec<String> = client
+            .list_mboxes()
+            .unwrap()
+            .into_iter()
+            .map(|mbox| mbox.name.to_string())
+            .collect();
+        assert_eq!(names, ["INBOX", "empty", "mbox"]);
+    }
+
+    #[test]
+    fn a_listing_leaves_out_a_spool_that_is_a_directory() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path().join("root");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(tmp.path().join("spool")).unwrap();
+
+        let mut client = MboxClient::new(root.as_path());
+        client.store.inbox = Some(MboxFsPath::from(tmp.path().join("spool")));
+        assert!(client.list_mboxes().unwrap().is_empty());
     }
 }

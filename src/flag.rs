@@ -8,8 +8,10 @@
 //! (old, no longer recent), `X-Status` holds `A` (answered), `F`
 //! (flagged), `T` (draft) and `D` (deleted), and `X-Keywords` holds the
 //! custom keywords. A message carrying none of those falls back to
-//! Thunderbird's `X-Mozilla-Status` bitfield and `X-Mozilla-Keys`, which
-//! are read but never written.
+//! Thunderbird's `X-Mozilla-Status` bitfield and `X-Mozilla-Keys`. Neither
+//! is added, but a flag write sets the read, replied, marked and expunged
+//! bits of an `X-Mozilla-Status` the message carries, so Thunderbird
+//! reads the flags Himalaya wrote.
 //!
 //! [`crate::scan`] records where the three written fields sit in each
 //! message, so [`crate::entry::update`] can swap them without parsing the
@@ -25,6 +27,15 @@ use crate::header;
 
 /// Header fields [`MboxFlags::to_header`] writes, lowercase.
 pub(crate) const FLAG_FIELDS: [&str; 3] = ["status", "x-status", "x-keywords"];
+
+/// The `X-Mozilla-Status` bits standing for flags: read, replied, marked
+/// and expunged.
+pub(crate) const MOZILLA_FLAGS: [(u16, MboxFlag); 4] = [
+    (0x0001, MboxFlag::Seen),
+    (0x0002, MboxFlag::Answered),
+    (0x0004, MboxFlag::Flagged),
+    (0x0008, MboxFlag::Deleted),
+];
 
 /// One flag of an mbox message.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -132,12 +143,7 @@ impl MboxFlags {
         }
 
         if let Some(bits) = mozilla {
-            for (bit, flag) in [
-                (0x0001, MboxFlag::Seen),
-                (0x0002, MboxFlag::Answered),
-                (0x0004, MboxFlag::Flagged),
-                (0x0008, MboxFlag::Deleted),
-            ] {
+            for (bit, flag) in MOZILLA_FLAGS {
                 if bits & bit != 0 {
                     flags.insert(flag);
                 }
@@ -186,6 +192,32 @@ impl MboxFlags {
         }
 
         out
+    }
+
+    /// Renders Thunderbird's `X-Mozilla-Keys` field from the keywords of
+    /// this set, as a flag write keeps it in step with `X-Keywords`.
+    pub fn to_mozilla_keys(&self, crlf: bool) -> Vec<u8> {
+        let mut out = b"X-Mozilla-Keys:".to_vec();
+        for flag in self.iter() {
+            if let MboxFlag::Keyword(keyword) = flag {
+                out.push(b' ');
+                out.extend_from_slice(keyword.as_bytes());
+            }
+        }
+        out.extend_from_slice(if crlf { b"\r\n" } else { b"\n" });
+        out
+    }
+
+    /// The `X-Mozilla-Status` bits of `bits` with the flag ones set from
+    /// this set, the others kept.
+    pub fn to_mozilla(&self, bits: u16) -> u16 {
+        MOZILLA_FLAGS.iter().fold(bits, |bits, (bit, flag)| {
+            if self.contains(flag) {
+                bits | bit
+            } else {
+                bits & !bit
+            }
+        })
     }
 
     fn insert_keywords(&mut self, value: &[u8]) {

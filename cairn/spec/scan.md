@@ -28,4 +28,4 @@ Each message SHALL be identified by the SHA-256 of its bytes, the volatile field
 
 ### Requirement: Flag fields are located
 
-Each entry SHALL record where its `Status`, `X-Status` and `X-Keywords` fields sit, so a rewrite can swap them without parsing the message.
+Each entry SHALL record where its `Status`, `X-Status`, `X-Keywords` and `X-Mozilla-Keys` fields sit, whether it carries an `X-Mozilla-Keys`, and where the four hex digits of an `X-Mozilla-Status` field sit with the bits they hold, so a rewrite can swap them without parsing the message.

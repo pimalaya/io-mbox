@@ -57,6 +57,15 @@ pub struct MboxEntry {
     /// Whether the message is a c-client `X-IMAP` pseudo message holding
     /// folder metadata, which clients hide.
     pub pseudo: bool,
+    /// Thunderbird's `X-Mozilla-Status` field, when the message carries
+    /// one of four hex digits, so a flag write keeps it in step.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub mozilla_status: Option<MboxMozillaStatus>,
+    /// Whether the message carries Thunderbird's `X-Mozilla-Keys` field,
+    /// which a flag write then writes again from the keywords, among the
+    /// flag fields.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub mozilla_keys: bool,
 }
 
 impl MboxEntry {
@@ -74,6 +83,18 @@ pub struct MboxSpan {
     pub offset: u64,
     /// Length of the range.
     pub len: u64,
+}
+
+/// The `X-Mozilla-Status` field of a message, which Thunderbird reads its
+/// flags from before the c-client ones.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct MboxMozillaStatus {
+    /// Where its four hex digits sit, relative to
+    /// [`MboxEntry::message_offset`].
+    pub offset: u64,
+    /// The bits they hold.
+    pub bits: u16,
 }
 
 /// A message with its bytes, unquoted.

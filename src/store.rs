@@ -15,6 +15,10 @@ pub const INBOX: &str = "INBOX";
 /// Suffix of the directory holding the children of a Thunderbird mbox.
 pub const SBD: &str = ".sbd";
 
+/// Suffix of the summary Thunderbird keeps beside an mbox, which it
+/// rebuilds when missing.
+pub const MSF: &str = ".msf";
+
 /// Directory holding mbox files, plus the spool and the layout used to
 /// translate logical mailbox names to on-disk paths.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]

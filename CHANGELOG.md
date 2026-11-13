@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `MboxClientError::lock_busy`, telling a lock another process held past the timeout from any other failure.
+- `MboxEntry::mozilla_status`, locating the `X-Mozilla-Status` digits of a message.
+- `MboxEntry::mozilla_keys` and `MboxFlags::to_mozilla_keys`, so a flag write writes Thunderbird's `X-Mozilla-Keys` again from the keywords.
+
+### Changed
+
+- A flag write keeps the read, replied, marked and expunged bits of an existing `X-Mozilla-Status` in step, so Thunderbird agrees.
+- An append refuses a non-empty file that does not open on a `From_` line (`MboxEntryAppendError::NotMbox`), and `MboxClient::list_mboxes` leaves such files out.
+- Deleting or renaming an mbox removes its Thunderbird `.msf` summary.
+- A flag write keeps an existing `X-Mozilla-Keys` in step with the keywords, where a set left the labels Thunderbird reads in place.
+- `MboxClient::list_mboxes` leaves out a spool that is a directory.
+
+### Fixed
+
+- A `Content-Length` whose body range does not end on a message boundary is ignored, as mutt does, instead of merging the following messages into one.
+- A huge lock timeout no longer overflows.
+
 ## [0.1.0] - 2026-09-30
 
 ### Added

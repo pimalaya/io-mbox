@@ -48,7 +48,7 @@ use thiserror::Error;
 
 use crate::{
     coroutine::*,
-    entry::{MboxEntry, MboxSpan},
+    entry::{MboxEntry, MboxMozillaStatus, MboxSpan},
     flag::MboxFlags,
     index::{
         MboxIndex,
@@ -460,13 +460,36 @@ impl Plan {
                     plan.updated += 1;
                     let header_end = entry.message_offset + entry.header_len;
 
+                    // NOTE: the X-Mozilla-Status digits are swapped in place,
+                    // same length, between the flag fields dropped.
+                    let mozilla = entry
+                        .mozilla_status
+                        .filter(|status| status.offset + 4 <= entry.header_len)
+                        .map(|status| MboxMozillaStatus {
+                            bits: flags.to_mozilla(status.bits),
+                            ..status
+                        });
+                    let digits = mozilla.map(|status| format!("{:04x}", status.bits));
+                    let mut cuts: Vec<(u64, u64, &[u8])> = entry
+                        .flag_spans
+                        .iter()
+                        .map(|span| (span.offset, span.len, [].as_slice()))
+                        .collect();
+                    if let (Some(status), Some(digits)) = (&mozilla, &digits) {
+                        cuts.push((status.offset, 4, digits.as_bytes()));
+                        cuts.sort_by_key(|(offset, ..)| *offset);
+                    }
+
                     let mut cursor = entry.offset;
                     let mut removed = 0;
-                    for span in &entry.flag_spans {
-                        let span_start = entry.message_offset + span.offset;
-                        push_copy(&mut pieces, cursor, span_start - cursor);
-                        cursor = span_start + span.len;
-                        removed += span.len;
+                    for (offset, len, bytes) in &cuts {
+                        let cut_start = entry.message_offset + offset;
+                        push_copy(&mut pieces, cursor, cut_start - cursor);
+                        if !bytes.is_empty() {
+                            pieces.push(Piece::Bytes(bytes.to_vec()));
+                        }
+                        cursor = cut_start + len;
+                        removed += len - bytes.len() as u64;
                     }
                     push_copy(&mut pieces, cursor, header_end - cursor);
 
@@ -487,6 +510,9 @@ impl Plan {
                     }
                     let prefix = lines.len() as u64;
                     lines.extend(flags.to_header(entry.crlf));
+                    if entry.mozilla_keys {
+                        lines.extend(flags.to_mozilla_keys(entry.crlf));
+                    }
                     let added = lines.len() as u64;
                     let flag_len = added - prefix;
                     if added > 0 {
@@ -495,7 +521,26 @@ impl Plan {
                     push_copy(&mut pieces, header_end, next - header_end);
 
                     let header_len = entry.header_len - removed + added;
-                    let mut header = strip_spans(&entry.header, &entry.flag_spans);
+                    let mut captured = entry.header.clone();
+                    if let (Some(status), Some(digits)) = (&mozilla, &digits) {
+                        let start = status.offset as usize;
+                        if let Some(old) = captured.get_mut(start..start + 4) {
+                            old.copy_from_slice(digits.as_bytes());
+                        }
+                    }
+                    let mut header = strip_spans(&captured, &entry.flag_spans);
+                    let mozilla_status = mozilla.map(|status| {
+                        let before: u64 = entry
+                            .flag_spans
+                            .iter()
+                            .filter(|span| span.offset < status.offset)
+                            .map(|span| span.len)
+                            .sum();
+                        MboxMozillaStatus {
+                            offset: status.offset - before,
+                            ..status
+                        }
+                    });
                     if entry.header.len() as u64 == entry.header_len {
                         header.extend_from_slice(&lines);
                     }
@@ -514,6 +559,7 @@ impl Plan {
                             }],
                         },
                         header,
+                        mozilla_status,
                         ..entry.clone()
                     });
                     plan.len += next - entry.offset - removed + added;
@@ -919,6 +965,59 @@ body three
 
     fn fs_empty() -> Fs {
         memfs(b"")
+    }
+
+    #[test]
+    fn a_flag_write_keeps_the_mozilla_status_in_step() {
+        let mbox = b"From - Mon Jan  1 00:00:00 2024\nX-Mozilla-Status: 0011\nX-Mozilla-Status2: 00000000\nStatus: RO\nSubject: one\n\nbody\n";
+        let entries = scan(mbox);
+        assert_eq!(entries[0].mozilla_status.map(|s| s.bits), Some(0x0011));
+
+        let mut fs = memfs(mbox);
+        let edits = BTreeMap::from([(
+            entries[0].id.clone(),
+            flags(&[MboxFlag::Flagged, MboxFlag::Answered]),
+        )]);
+        let out = fs.run(edits, 5).unwrap();
+
+        assert_eq!(
+            fs.mbox(),
+            b"From - Mon Jan  1 00:00:00 2024\nX-Mozilla-Status: 0016\nX-Mozilla-Status2: 00000000\nSubject: one\nX-Status: AF\n\nbody\n"
+                .as_slice()
+        );
+        let fresh = scan(fs.mbox());
+        assert_eq!(out.index.entries, fresh);
+        assert_eq!(fresh[0].id, entries[0].id);
+        assert_eq!(fresh[0].mozilla_status.map(|s| s.bits), Some(0x0016));
+    }
+
+    #[test]
+    fn a_flag_write_keeps_the_mozilla_keys_in_step() {
+        let mbox = b"From - Mon Jan  1 00:00:00 2024\nX-Mozilla-Status: 0001\nX-Mozilla-Keys: $label1 todo      \nSubject: one\nX-Keywords: $label1 todo\n\nbody\n";
+        let entries = scan(mbox);
+        assert!(entries[0].mozilla_keys);
+
+        let mut fs = memfs(mbox);
+        let keyword = MboxFlag::Keyword("todo".into());
+        let edits = BTreeMap::from([(entries[0].id.clone(), flags(&[MboxFlag::Seen, keyword]))]);
+        let out = fs.run(edits, 5).unwrap();
+
+        assert_eq!(
+            fs.mbox(),
+            b"From - Mon Jan  1 00:00:00 2024\nX-Mozilla-Status: 0001\nSubject: one\nStatus: R\nX-Keywords: todo\nX-Mozilla-Keys: todo\n\nbody\n"
+                .as_slice()
+        );
+        let fresh = scan(fs.mbox());
+        assert_eq!(out.index.entries, fresh);
+        assert_eq!(fresh[0].id, entries[0].id);
+
+        let edits = BTreeMap::from([(entries[0].id.clone(), flags(&[]))]);
+        fs.run(edits, 5).unwrap();
+        assert_eq!(
+            fs.mbox(),
+            b"From - Mon Jan  1 00:00:00 2024\nX-Mozilla-Status: 0000\nSubject: one\nX-Mozilla-Keys:\n\nbody\n"
+                .as_slice()
+        );
     }
 
     #[test]

@@ -1,14 +1,15 @@
 //! I/O-free coroutine renaming an mbox file.
 //!
 //! Only the file moves: in the Thunderbird layout, the `.sbd` directory
-//! holding its children keeps its name.
+//! holding its children keeps its name. The Thunderbird summary of the
+//! source is removed, Thunderbird rebuilding one for the target.
 
 use core::fmt;
 
 use log::debug;
 use thiserror::Error;
 
-use crate::{coroutine::*, path::MboxFsPath};
+use crate::{coroutine::*, path::MboxFsPath, store::MSF};
 
 /// Failure causes of a [`MboxRename`] step.
 #[derive(Clone, Debug, Error)]
@@ -82,6 +83,11 @@ impl MboxCoroutine for MboxRename {
             }
             (State::Rename, Some(MboxReply::Rename)) => {
                 debug!("mbox renamed");
+                self.state = State::RemoveSummary;
+                let summary = self.from.with_suffix(MSF);
+                MboxCoroutineState::Yielded(MboxYield::WantsFileRemove(summary))
+            }
+            (State::RemoveSummary, Some(MboxReply::FileRemove)) => {
                 self.state = State::Done;
                 MboxCoroutineState::Complete(Ok(()))
             }
@@ -97,6 +103,7 @@ enum State {
     StatTo,
     CreateDir,
     Rename,
+    RemoveSummary,
     Done,
 }
 
@@ -108,6 +115,7 @@ impl fmt::Display for State {
             Self::StatTo => f.write_str("stat target"),
             Self::CreateDir => f.write_str("create parent"),
             Self::Rename => f.write_str("rename file"),
+            Self::RemoveSummary => f.write_str("remove summary"),
             Self::Done => f.write_str("done"),
         }
     }
@@ -132,6 +140,10 @@ mod tests {
         ));
         assert!(matches!(
             cor.resume(Some(MboxReply::Rename)),
+            MboxCoroutineState::Yielded(MboxYield::WantsFileRemove(p)) if p.as_str() == "a.msf"
+        ));
+        assert!(matches!(
+            cor.resume(Some(MboxReply::FileRemove)),
             MboxCoroutineState::Complete(Ok(()))
         ));
 

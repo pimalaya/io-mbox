@@ -38,7 +38,7 @@ use crate::{
     entry::MboxEntry,
     flag::{FLAG_FIELDS, MboxFlags},
     format::MboxFormat,
-    from_line::MboxFromLine,
+    from_line::{HEAD_LEN, MboxFromLine},
     header,
     lock::{MboxLock, MboxLockOptions, acquire::*, release::*},
     mbox_try,
@@ -55,6 +55,9 @@ pub enum MboxEntryAppendError {
     /// The mbox does not exist.
     #[error("Mbox message append failed: {0} not found")]
     NotFound(MboxFsPath),
+    /// The file is not empty and does not open on a `From_` line.
+    #[error("Mbox message append failed: {0} is not an mbox, it does not open on a From_ line")]
+    NotMbox(MboxFsPath),
     /// The locks could not be taken.
     #[error(transparent)]
     Lock(#[from] MboxLockAcquireError),
@@ -140,6 +143,17 @@ impl MboxEntryAppend {
         self.resume(None)
     }
 
+    /// Reads the last bytes of the file, to pad the previous message.
+    fn read_end(&mut self) -> MboxCoroutineState<MboxYield, <Self as MboxCoroutine>::Return> {
+        let len = self.size.min(3);
+        self.state = State::ReadEnd;
+        MboxCoroutineState::Yielded(MboxYield::WantsFileRead {
+            path: self.path.clone(),
+            offset: self.size - len,
+            len: len as usize,
+        })
+    }
+
     fn write(
         &mut self,
         tail: &[u8],
@@ -202,15 +216,25 @@ impl MboxCoroutine for MboxEntryAppend {
                 let err = MboxEntryAppendError::NotFound(self.path.clone());
                 self.finish(Err(err))
             }
-            (State::Stat, Some(MboxReply::FileMeta(Some(meta)))) => {
+            (State::Stat, Some(MboxReply::FileMeta(Some(meta)))) if meta.size > 0 => {
                 self.size = meta.size;
-                let len = meta.size.min(3);
-                self.state = State::ReadEnd;
+                self.state = State::ReadHead;
                 MboxCoroutineState::Yielded(MboxYield::WantsFileRead {
                     path: self.path.clone(),
-                    offset: meta.size - len,
-                    len: len as usize,
+                    offset: 0,
+                    len: meta.size.min(HEAD_LEN) as usize,
                 })
+            }
+            (State::ReadHead, Some(MboxReply::FileRead(head))) => {
+                if !MboxFromLine::opens_mbox(&head) {
+                    let err = MboxEntryAppendError::NotMbox(self.path.clone());
+                    return self.finish(Err(err));
+                }
+                self.read_end()
+            }
+            (State::Stat, Some(MboxReply::FileMeta(Some(meta)))) => {
+                self.size = meta.size;
+                self.read_end()
             }
             (State::ReadEnd, Some(MboxReply::FileRead(tail))) => {
                 self.state = State::Time(tail);
@@ -247,6 +271,7 @@ enum State {
     Checking,
     Lock(MboxLockAcquire),
     Stat,
+    ReadHead,
     ReadEnd,
     Time(Vec<u8>),
     Write,
@@ -262,6 +287,7 @@ impl fmt::Display for State {
             Self::Checking => f.write_str("check mbox"),
             Self::Lock(_) => f.write_str("lock mbox"),
             Self::Stat => f.write_str("stat mbox"),
+            Self::ReadHead => f.write_str("read head"),
             Self::ReadEnd => f.write_str("read end"),
             Self::Time(_) => f.write_str("read time"),
             Self::Write => f.write_str("write messages"),
@@ -473,12 +499,27 @@ From MAILER-DAEMON Thu Jan  1 00:00:00 1970\nSubject: y\n\nno newline\n\n"
             (b"x\n\n", b""),
             (b"x\r\n\r\n", b""),
         ] {
-            let mut file = before.to_vec();
+            let mut file = b"From a@b Mon Jan  1 00:00:00 2024\n\n".to_vec();
+            file.extend_from_slice(before);
+            let before = file.clone();
             let entries = run(&mut file, vec![item(b"Subject: x\n\nbody\n")], unlocked()).unwrap();
             let offset = before.len() + pad.len();
             assert_eq!(&file[before.len()..offset], pad);
             assert_eq!(entries[0].offset as usize, offset);
         }
+    }
+
+    #[test]
+    fn refuses_a_file_that_is_no_mbox() {
+        for before in [b"root:x:0:0::/root:/bin/sh\n".as_slice(), b"\x7fELF\x02"] {
+            let mut file = before.to_vec();
+            let result = run(&mut file, vec![item(b"Subject: x\n\nbody\n")], unlocked());
+            assert!(matches!(result, Err(MboxEntryAppendError::NotMbox(_))));
+            assert_eq!(file, before);
+        }
+
+        let mut file = b"\nFrom a@b Mon Jan  1 00:00:00 2024\n\nx\n".to_vec();
+        assert!(run(&mut file, vec![item(b"Subject: x\n\nbody\n")], unlocked()).is_ok());
     }
 
     #[test]

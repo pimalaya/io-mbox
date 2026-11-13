@@ -1,5 +1,5 @@
 //! I/O-free coroutine deleting an mbox file, under lock so no delivery
-//! lands in it while it goes.
+//! lands in it while it goes. The Thunderbird summary beside it goes too.
 
 use core::fmt;
 
@@ -11,6 +11,7 @@ use crate::{
     lock::{MboxLock, MboxLockOptions, acquire::*, release::*},
     mbox_try,
     path::MboxFsPath,
+    store::MSF,
 };
 
 /// Failure causes of a [`MboxDelete`] step.
@@ -97,8 +98,11 @@ impl MboxCoroutine for MboxDelete {
             }
             (State::Remove, Some(MboxReply::FileRemove)) => {
                 debug!("mbox deleted");
-                self.finish(Ok(()))
+                self.state = State::RemoveSummary;
+                let summary = self.path.with_suffix(MSF);
+                MboxCoroutineState::Yielded(MboxYield::WantsFileRemove(summary))
             }
+            (State::RemoveSummary, Some(MboxReply::FileRemove)) => self.finish(Ok(())),
             (State::Release(release), arg) => {
                 mbox_try!(release, arg);
                 self.state = State::Done;
@@ -119,6 +123,7 @@ enum State {
     Lock(MboxLockAcquire),
     Stat,
     Remove,
+    RemoveSummary,
     Release(MboxLockRelease),
     Done,
 }
@@ -131,6 +136,7 @@ impl fmt::Display for State {
             Self::Lock(_) => f.write_str("lock mbox"),
             Self::Stat => f.write_str("stat mbox"),
             Self::Remove => f.write_str("remove mbox"),
+            Self::RemoveSummary => f.write_str("remove summary"),
             Self::Release(_) => f.write_str("unlock mbox"),
             Self::Done => f.write_str("done"),
         }
@@ -162,6 +168,10 @@ mod tests {
         assert!(matches!(
             cor.resume(Some(MboxReply::FileMeta(meta))),
             MboxCoroutineState::Yielded(MboxYield::WantsFileRemove(_))
+        ));
+        assert!(matches!(
+            cor.resume(Some(MboxReply::FileRemove)),
+            MboxCoroutineState::Yielded(MboxYield::WantsFileRemove(p)) if p.as_str() == "a.msf"
         ));
         assert!(matches!(
             cor.resume(Some(MboxReply::FileRemove)),

@@ -54,7 +54,7 @@ impl MboxLockAcquire {
 
     fn max_attempts(&self) -> u64 {
         let timeout = self.opts.timeout_secs.unwrap_or(TIMEOUT_SECS);
-        (timeout * 1000 / RETRY_MS).max(1)
+        (timeout.saturating_mul(1000) / RETRY_MS).max(1)
     }
 
     fn dotlock(&mut self) -> MboxCoroutineState<MboxYield, <Self as MboxCoroutine>::Return> {
@@ -383,6 +383,15 @@ mod tests {
             MboxYield::WantsFcntlLock(path()),
         );
         assert!(expect_complete(&mut cor, Some(MboxReply::FcntlLock(true))).is_ok());
+    }
+
+    #[test]
+    fn a_huge_timeout_waits_without_overflowing() {
+        let opts = MboxLockOptions {
+            timeout_secs: Some(u64::MAX),
+            ..Default::default()
+        };
+        assert_eq!(lock(opts).max_attempts(), u64::MAX / RETRY_MS);
     }
 
     #[test]
