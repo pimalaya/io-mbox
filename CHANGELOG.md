@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-13
+
 ### Added
 
 - `MboxClientError::lock_busy`, telling a lock another process held past the timeout from any other failure.
@@ -52,5 +54,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 [himalaya#697]: https://github.com/pimalaya/himalaya/issues/697
 
-[unreleased]: https://github.com/pimalaya/io-mbox/compare/v0.1.0..HEAD
+[unreleased]: https://github.com/pimalaya/io-mbox/compare/v0.2.0..HEAD
+[0.2.0]: https://github.com/pimalaya/io-mbox/compare/v0.1.0..v0.2.0
 [0.1.0]: https://github.com/pimalaya/io-mbox/compare/root..v0.1.0
