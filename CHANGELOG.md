@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `MboxKeyword`, a keyword checked to read back as written from `X-Keywords`.
 - `MboxPath::names_mbox`, telling a name that stands for a file below a store root.
 - `MboxYield::WantsDirCanonical`, `MboxReply::DirCanonical` and `MboxFileKind::DirLink`, which the listing walks links with.
+- `MboxYield::WantsDotlockRefresh` and `MboxReply::DotlockRefresh`, which a long rewrite keeps its dotlock fresh with.
 
 ### Changed
 
@@ -25,7 +26,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `MboxClient::list_mboxes` leaves out a spool that is a directory.
 - An append fails before the write when a message would not read back as one entry (`MboxEntryAppendError::Unreadable`).
 - A flag write or a removal given an index scans each message to edit again, and fails before the write when the file no longer holds it (`MboxEntryUpdateError::Stale`).
-- `MboxStore::resolve` returns `None` for a name that is empty or holds a `.` or `..` segment or a NUL, and the client fails with `MboxClientError::InvalidName`.
+- `MboxStore::resolve` returns `None` for a name that is empty, holds a NUL or a `.` or `..` segment, or has a segment ending in `.lock` or `.msf`, and the client fails with `MboxClientError::InvalidName`.
+- `MboxYield::WantsTempFile` names the mbox and the offset, and the client creates the file beside the mbox, hidden and with mode 0600 on Unix, falling back to the system directory.
+- `MboxClientError::Interrupted` names the mbox and the offset its temporary file belongs at, and a failed run removes a temporary file whose copy back had not started.
 - `MboxFlag::Keyword` holds an `MboxKeyword`, so a keyword with a whitespace, a comma or a control character, or longer than 255 bytes, is refused.
 
 ### Fixed
@@ -38,6 +41,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `MboxFromLine::format` no longer writes a line that does not read back: a sender too long for the line becomes `MAILER-DAEMON`, the year takes four digits and the date stays within the years 0000 to 9999.
 - A flag write starts from the flags and flag fields the file holds, where a resumed or reused index could skip an edit or cut the wrong bytes.
 - A listing walks each directory once, where a symbolic link back into the tree was followed again and again.
+- A release leaves alone a dotlock another writer replaced, and no longer fails when the dotlock is gone.
+- A flag write or a removal finds its messages in one pass over the index, where it searched the index once per edit.
 
 ## [0.1.0] - 2026-09-30
 

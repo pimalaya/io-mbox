@@ -10,10 +10,20 @@
 //! locks MTAs take, and a classic `F_SETLK` on other Unix systems. On
 //! Windows the fcntl lock is a no-op and the dotlock does the work.
 //!
+//! A dotlock holds the pid of the process, and is only refreshed or
+//! removed while it still is the file this run created: another writer
+//! may have broken and replaced it.
+//!
+//! The temporary file of a rewrite is created beside the mbox, hidden and
+//! readable by its owner alone, so it shares its filesystem and outlives
+//! a reboot. The system directory is the fallback where the directory of
+//! the mbox cannot be written to.
+//!
 //! A run that fails removes the dotlocks it created, and closes the files
-//! it opened (which drops their fcntl locks). A temporary file it could
-//! not remove is kept and named in the error: when a rewrite was being
-//! copied back, it is the intact copy of the mbox tail.
+//! it opened (which drops their fcntl locks). It removes its temporary
+//! file too, unless the copy back over the mbox had started: the file is
+//! then the intact copy of the mbox tail, kept and named in the error
+//! with the mbox and the offset it belongs at.
 
 use core::mem;
 
@@ -25,12 +35,15 @@ use alloc::{
 };
 
 #[cfg(unix)]
-use std::os::{fd::AsRawFd, unix::fs::MetadataExt};
+use std::os::{
+    fd::AsRawFd,
+    unix::fs::{MetadataExt, OpenOptionsExt},
+};
 use std::{
     env,
     fs::{self, File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process,
     sync::atomic::{AtomicU32, Ordering},
     thread,
@@ -93,9 +106,11 @@ pub enum MboxClientError {
     /// The mbox rename coroutine failed.
     #[error(transparent)]
     Rename(#[from] MboxRenameError),
-    /// The name is empty, or holds a `.` or `..` segment or a NUL, so it
-    /// stands for no file below the root.
-    #[error("Mbox name {0:?} is invalid: empty, or holding a `.` or `..` segment or a NUL")]
+    /// The name stands for no mbox below the root: it is empty, holds a
+    /// NUL or a `.` or `..` segment, or names a dotlock or a summary.
+    #[error(
+        "Mbox name {0:?} is invalid: empty, holding a NUL or a `.` or `..` segment, or named like a `.lock` or `.msf` side file"
+    )]
     InvalidName(String),
     /// No message has this id.
     #[error("Mbox message {0} not found")]
@@ -105,15 +120,18 @@ pub enum MboxClientError {
         "Cannot create dotlock {0}: permission denied, skip dotlocking to rely on fcntl locks alone"
     )]
     DotlockDenied(MboxFsPath),
-    /// A run failed while a temporary file it created still existed. When
-    /// a rewrite was being copied back, it holds the only intact copy of
-    /// the mbox tail.
-    #[error("{source}, temporary file kept at {temp}")]
+    /// A run failed while a temporary file was being copied back over an
+    /// mbox: it holds the only intact copy of the mbox from `offset` on.
+    #[error("{source}, temporary file kept at {temp}: it holds {path} from offset {offset} on")]
     Interrupted {
         /// Why the run failed.
         source: Box<MboxClientError>,
         /// The temporary file to recover from.
         temp: MboxFsPath,
+        /// The mbox it was being copied back over.
+        path: MboxFsPath,
+        /// Where in the mbox its first byte belongs.
+        offset: u64,
     },
     /// A filesystem operation failed.
     #[error(transparent)]
@@ -158,9 +176,10 @@ pub struct MboxClient {
     pub scanner: MboxScannerOptions,
     /// Size of a read, 64 KiB when unset.
     pub chunk_size: Option<usize>,
-    /// Directory holding the temporary files of rewrites, the system one
-    /// when unset. A rewrite of a large mbox needs as much free room
-    /// there as the rewritten tail.
+    /// Directory holding the temporary files of rewrites. Unset, the one
+    /// of the mbox, or the system one where that cannot be written to. A
+    /// rewrite of a large mbox needs as much free room there as the
+    /// rewritten tail.
     pub temp_dir: Option<PathBuf>,
 }
 
@@ -369,9 +388,19 @@ struct Run {
     /// Files open for writing, also holding the fcntl locks.
     writers: BTreeMap<MboxFsPath, File>,
     /// Dotlocks created and not yet removed.
-    dotlocks: BTreeSet<MboxFsPath>,
+    dotlocks: BTreeMap<MboxFsPath, Dotlock>,
     /// Temporary files created and not yet removed.
-    temps: BTreeSet<MboxFsPath>,
+    temps: BTreeMap<MboxFsPath, Temp>,
+}
+
+/// What a temporary file is for.
+struct Temp {
+    /// The mbox it holds the tail of.
+    path: MboxFsPath,
+    /// Where that tail starts in the mbox.
+    offset: u64,
+    /// Whether the mbox was written since, the copy back having started.
+    copying_back: bool,
 }
 
 impl Run {
@@ -442,6 +471,7 @@ impl Run {
                 bytes,
             } => {
                 trace!("write {} bytes at {offset} of {path}", bytes.len());
+                self.mark_written(&path);
                 let file = self.writer(&path)?;
                 let size = file.metadata()?.len();
                 file.seek(SeekFrom::Start(offset))?;
@@ -455,6 +485,7 @@ impl Run {
             }
             MboxYield::WantsFileTruncate { path, len } => {
                 trace!("truncate {path} to {len}");
+                self.mark_written(&path);
                 self.writer(&path)?.set_len(len)?;
                 MboxReply::FileTruncate
             }
@@ -493,24 +524,17 @@ impl Run {
                 fs::rename(from.as_str(), to.as_str())?;
                 MboxReply::Rename
             }
-            MboxYield::WantsTempFile => {
-                let dir = temp_dir.cloned().unwrap_or_else(env::temp_dir);
-                let nanos = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.subsec_nanos())
-                    .unwrap_or_default();
-                let count = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-                let name = format!("io-mbox-{}-{nanos}-{count}", process::id());
-                let path = MboxFsPath::from(dir.join(name));
-                trace!("create temp {path}");
-                let file = OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .create_new(true)
-                    .open(path.as_str())?;
-                self.writers.insert(path.clone(), file);
-                self.temps.insert(path.clone());
-                MboxReply::TempFile(path)
+            MboxYield::WantsTempFile { path, offset } => {
+                let (temp, file) = create_temp(&path, temp_dir)?;
+                trace!("create temp {temp}");
+                self.writers.insert(temp.clone(), file);
+                let state = Temp {
+                    path,
+                    offset,
+                    copying_back: false,
+                };
+                self.temps.insert(temp.clone(), state);
+                MboxReply::TempFile(temp)
             }
             MboxYield::WantsDotlockCreate(path) => {
                 let created = match OpenOptions::new()
@@ -519,7 +543,14 @@ impl Run {
                     .open(path.as_str())
                 {
                     Ok(mut file) => {
-                        let _ = write!(file, "{}", process::id());
+                        let pid = process::id().to_string();
+                        let written = file.write_all(pid.as_bytes()).is_ok();
+                        let inode = file.metadata().map(|meta| file_meta(&meta).inode);
+                        let dotlock = Dotlock {
+                            inode: inode.ok(),
+                            content: if written { pid } else { String::new() },
+                        };
+                        self.dotlocks.insert(path.clone(), dotlock);
                         true
                     }
                     Err(err) if err.kind() == io::ErrorKind::AlreadyExists => false,
@@ -529,15 +560,35 @@ impl Run {
                     Err(err) => return Err(err.into()),
                 };
                 trace!("create dotlock {path}: {created}");
-                if created {
-                    self.dotlocks.insert(path);
-                }
                 MboxReply::DotlockCreate(created)
             }
+            MboxYield::WantsDotlockRefresh(path) => {
+                match self.dotlocks.get(&path) {
+                    Some(dotlock) if dotlock.is_at(&path) => {
+                        let file = OpenOptions::new().write(true).open(path.as_str());
+                        let refreshed = file.and_then(|file| file.set_modified(SystemTime::now()));
+                        trace!("refresh dotlock {path}: {refreshed:?}");
+                    }
+                    _ => warn!("dotlock {path} was replaced by another writer"),
+                }
+                MboxReply::DotlockRefresh
+            }
             MboxYield::WantsDotlockRemove(path) => {
-                trace!("remove dotlock {path}");
-                fs::remove_file(path.as_str())?;
-                self.dotlocks.remove(&path);
+                // NOTE: a lock taken in an earlier run is known by its pid.
+                let dotlock = self.dotlocks.remove(&path).unwrap_or_else(|| Dotlock {
+                    inode: None,
+                    content: process::id().to_string(),
+                });
+                if dotlock.is_at(&path) {
+                    trace!("remove dotlock {path}");
+                    match fs::remove_file(path.as_str()) {
+                        Ok(()) => {}
+                        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                        Err(err) => return Err(err.into()),
+                    }
+                } else {
+                    warn!("dotlock {path} was replaced by another writer, left in place");
+                }
                 MboxReply::DotlockRemove
             }
             MboxYield::WantsFcntlLock(path) => {
@@ -590,27 +641,114 @@ impl Run {
         self.writers.remove(path);
     }
 
+    /// Notes that the file at `path` changes: a temporary file holding
+    /// its tail is from then on the only intact copy of it.
+    fn mark_written(&mut self, path: &MboxFsPath) {
+        for temp in self.temps.values_mut() {
+            temp.copying_back |= temp.path == *path;
+        }
+    }
+
     /// Cleans up after a failed run: removes the dotlocks, closes the
-    /// files (dropping their fcntl locks) and keeps the temporary files,
-    /// which may hold the only intact copy of a rewritten tail.
+    /// files (dropping their fcntl locks) and removes the temporary
+    /// files, but the one being copied back, the only intact copy of a
+    /// rewritten tail.
     fn abort(&mut self, err: MboxClientError) -> MboxClientError {
-        for path in mem::take(&mut self.dotlocks) {
-            let _ = fs::remove_file(path.as_str());
+        for (path, dotlock) in mem::take(&mut self.dotlocks) {
+            if dotlock.is_at(&path) {
+                let _ = fs::remove_file(path.as_str());
+            }
         }
         self.readers.clear();
         self.writers.clear();
 
-        match mem::take(&mut self.temps).into_iter().next() {
-            Some(temp) => {
+        let mut kept = None;
+        for (temp, state) in mem::take(&mut self.temps) {
+            if state.copying_back {
+                kept = Some((temp, state));
+            } else {
+                let _ = fs::remove_file(temp.as_str());
+            }
+        }
+
+        match kept {
+            Some((temp, Temp { path, offset, .. })) => {
                 warn!("temporary file kept at {temp}");
                 MboxClientError::Interrupted {
                     source: Box::new(err),
                     temp,
+                    path,
+                    offset,
                 }
             }
             None => err,
         }
     }
+}
+
+/// A dotlock as this process created it.
+struct Dotlock {
+    /// Inode of the file, when this run created it.
+    inode: Option<u64>,
+    /// What the file holds: the pid, or nothing when writing it failed.
+    content: String,
+}
+
+impl Dotlock {
+    /// Whether the file at `path` still is this dotlock, another writer
+    /// not having broken and replaced it.
+    fn is_at(&self, path: &MboxFsPath) -> bool {
+        let inode = fs::metadata(path.as_str()).map(|meta| file_meta(&meta).inode);
+        let same_file = inode.is_ok_and(|inode| self.inode.is_none_or(|own| own == inode));
+        let content = fs::read_to_string(path.as_str());
+        same_file && content.is_ok_and(|content| content == self.content)
+    }
+}
+
+/// Creates the temporary file of a rewrite of the mbox at `path`: in
+/// `dir` when given, else beside the mbox, else in the system directory
+/// when the one of the mbox cannot be written to.
+fn create_temp(path: &MboxFsPath, dir: Option<&PathBuf>) -> io::Result<(MboxFsPath, File)> {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or_default();
+    let count = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let name = format!(".io-mbox-{}-{nanos}-{count}", process::id());
+
+    let beside = path.parent().map(|parent| PathBuf::from(parent.as_str()));
+    let fallback = dir.is_none().then(env::temp_dir);
+    let dir = dir.cloned().or(beside).unwrap_or_default();
+    let temp = dir.join(&name);
+
+    match (create_private(&temp), fallback) {
+        (Err(err), Some(fallback)) if err.kind() == io::ErrorKind::PermissionDenied => {
+            let temp = fallback.join(&name);
+            create_private(&temp).map(|file| (MboxFsPath::from(temp), file))
+        }
+        (file, _) => file.map(|file| (MboxFsPath::from(temp), file)),
+    }
+}
+
+/// Creates a file its owner alone can read, failing when it exists.
+#[cfg(unix)]
+fn create_private(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+}
+
+/// Creates a file, failing when it exists.
+#[cfg(not(unix))]
+fn create_private(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(path)
 }
 
 /// Whether the file at `path` opens an mbox, `true` when it cannot be
@@ -686,29 +824,160 @@ mod tests {
 
     use crate::{client::*, path::MboxFsPath};
 
+    const MBOX: &[u8] = b"From a@b Mon Jan  1 00:00:00 2024\n\nx\n";
+
+    fn temp(run: &mut Run, mbox: &MboxFsPath, dir: Option<&PathBuf>) -> MboxFsPath {
+        let ask = MboxYield::WantsTempFile {
+            path: mbox.clone(),
+            offset: 7,
+        };
+        match run.answer(ask, dir).unwrap() {
+            MboxReply::TempFile(temp) => temp,
+            reply => panic!("unexpected {reply:?}"),
+        }
+    }
+
     #[test]
-    fn abort_removes_dotlocks_and_keeps_temp_files() {
+    fn abort_removes_dotlocks_and_keeps_a_temp_file_being_copied_back() {
         let tmp = tempdir().unwrap();
+        let mbox = MboxFsPath::from(tmp.path().join("box"));
         let dotlock = MboxFsPath::from(tmp.path().join("box.lock"));
-        let temp = MboxFsPath::from(tmp.path().join("io-mbox-temp"));
-        fs::write(dotlock.as_str(), b"").unwrap();
-        fs::write(temp.as_str(), b"tail").unwrap();
+        fs::write(mbox.as_str(), MBOX).unwrap();
 
         let mut run = Run::default();
-        run.dotlocks.insert(dotlock.clone());
-        run.temps.insert(temp.clone());
+        let lock = MboxYield::WantsDotlockCreate(dotlock.clone());
+        assert_eq!(
+            run.answer(lock, None).unwrap(),
+            MboxReply::DotlockCreate(true)
+        );
+        let unused = temp(&mut run, &mbox, None);
+        let err = run.abort(io::Error::other("disk full").into());
+        assert!(matches!(err, MboxClientError::Io(_)));
+        assert!(!fs::exists(dotlock.as_str()).unwrap());
+        assert!(!fs::exists(unused.as_str()).unwrap());
 
+        let mut run = Run::default();
+        let lock = MboxYield::WantsDotlockCreate(dotlock.clone());
+        assert_eq!(
+            run.answer(lock, None).unwrap(),
+            MboxReply::DotlockCreate(true)
+        );
+        let kept = temp(&mut run, &mbox, None);
+        let write = MboxYield::WantsFileWrite {
+            path: mbox.clone(),
+            offset: 7,
+            bytes: b"y".to_vec(),
+        };
+        run.answer(write, None).unwrap();
         let err = run.abort(io::Error::other("disk full").into());
         assert!(!fs::exists(dotlock.as_str()).unwrap());
-        assert!(fs::exists(temp.as_str()).unwrap());
-        assert!(matches!(&err, MboxClientError::Interrupted { temp: t, .. } if *t == temp));
-        assert!(
-            err.to_string()
-                .contains("disk full, temporary file kept at")
-        );
+        assert!(fs::exists(kept.as_str()).unwrap());
+        assert!(matches!(
+            &err,
+            MboxClientError::Interrupted { temp, path, offset: 7, .. } if *temp == kept && *path == mbox
+        ));
+        let message = err.to_string();
+        assert!(message.contains("disk full, temporary file kept at"));
+        assert!(message.ends_with(&format!("it holds {mbox} from offset 7 on")));
 
         let err = Run::default().abort(io::Error::other("disk full").into());
         assert!(matches!(err, MboxClientError::Io(_)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_temp_file_is_private_and_beside_its_mbox() {
+        let tmp = tempdir().unwrap();
+        let mbox = MboxFsPath::from(tmp.path().join("box"));
+        let mut run = Run::default();
+
+        let beside = temp(&mut run, &mbox, None);
+        assert_eq!(beside.parent(), mbox.parent());
+        assert!(beside.file_name().unwrap().starts_with(".io-mbox-"));
+        let mode = fs::metadata(beside.as_str()).unwrap().mode();
+        assert_eq!(mode & 0o777, 0o600);
+
+        let dir = tmp.path().join("elsewhere");
+        fs::create_dir(&dir).unwrap();
+        let elsewhere = temp(&mut run, &mbox, Some(&dir));
+        assert_eq!(elsewhere.parent(), Some(MboxFsPath::from(dir.as_path())));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_temp_file_falls_back_to_the_system_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempdir().unwrap();
+        let spool = tmp.path().join("spool");
+        fs::create_dir(&spool).unwrap();
+        let mbox = MboxFsPath::from(spool.join("box"));
+        let read_only = fs::Permissions::from_mode(0o555);
+        fs::set_permissions(&spool, read_only).unwrap();
+
+        let mut run = Run::default();
+        let temp = temp(&mut run, &mbox, None);
+        fs::remove_file(temp.as_str()).unwrap();
+
+        // NOTE: root writes anywhere, the fallback then never runs.
+        if fs::write(spool.join("probe"), b"").is_err() {
+            assert!(Path::new(temp.as_str()).starts_with(env::temp_dir()));
+            let mode = fs::Permissions::from_mode(0o755);
+            fs::set_permissions(&spool, mode).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_dotlock_replaced_by_another_writer_is_left_alone() {
+        let tmp = tempdir().unwrap();
+        let dotlock = MboxFsPath::from(tmp.path().join("box.lock"));
+        let pid = process::id().to_string();
+        let old = UNIX_EPOCH + Duration::from_secs(1000);
+        let age = |path: &MboxFsPath| {
+            let file = OpenOptions::new().write(true).open(path.as_str()).unwrap();
+            file.set_modified(old).unwrap();
+        };
+        let modified = |path: &MboxFsPath| fs::metadata(path.as_str()).unwrap().modified().unwrap();
+
+        let mut run = Run::default();
+        let lock = MboxYield::WantsDotlockCreate(dotlock.clone());
+        assert_eq!(
+            run.answer(lock, None).unwrap(),
+            MboxReply::DotlockCreate(true)
+        );
+        assert_eq!(fs::read_to_string(dotlock.as_str()).unwrap(), pid);
+        age(&dotlock);
+        let refresh = MboxYield::WantsDotlockRefresh(dotlock.clone());
+        let reply = run.answer(refresh.clone(), None).unwrap();
+        assert_eq!(reply, MboxReply::DotlockRefresh);
+        assert!(modified(&dotlock) > old);
+
+        fs::remove_file(dotlock.as_str()).unwrap();
+        fs::write(dotlock.as_str(), b"1").unwrap();
+        age(&dotlock);
+        assert_eq!(
+            run.answer(refresh, None).unwrap(),
+            MboxReply::DotlockRefresh
+        );
+        assert_eq!(modified(&dotlock), old);
+        let unlock = MboxYield::WantsDotlockRemove(dotlock.clone());
+        let reply = run.answer(unlock.clone(), None).unwrap();
+        assert_eq!(reply, MboxReply::DotlockRemove);
+        assert_eq!(fs::read(dotlock.as_str()).unwrap(), b"1");
+
+        fs::remove_file(dotlock.as_str()).unwrap();
+        assert_eq!(run.answer(unlock, None).unwrap(), MboxReply::DotlockRemove);
+
+        let mut run = Run::default();
+        let lock = MboxYield::WantsDotlockCreate(dotlock.clone());
+        assert_eq!(
+            run.answer(lock, None).unwrap(),
+            MboxReply::DotlockCreate(true)
+        );
+        fs::remove_file(dotlock.as_str()).unwrap();
+        fs::write(dotlock.as_str(), b"1").unwrap();
+        run.abort(io::Error::other("disk full").into());
+        assert_eq!(fs::read(dotlock.as_str()).unwrap(), b"1");
     }
 
     #[test]
@@ -723,6 +992,8 @@ mod tests {
             MboxClientError::Interrupted {
                 source: Box::new(MboxClientError::Delete(MboxDeleteError::Lock(busy))),
                 temp: MboxFsPath::new("t"),
+                path: MboxFsPath::new("a"),
+                offset: 0,
             },
         ];
         for err in errs {

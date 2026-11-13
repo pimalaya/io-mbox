@@ -100,14 +100,24 @@ pub enum MboxYield {
         /// New path.
         to: MboxFsPath,
     },
-    /// Create a fresh private temporary file, answered by
+    /// Create a fresh private temporary file for the bytes of `path` from
+    /// `offset` on, beside it where possible, answered by
     /// [`MboxReply::TempFile`].
-    WantsTempFile,
+    WantsTempFile {
+        /// File the temporary one is copied back over.
+        path: MboxFsPath,
+        /// Offset it is copied back at.
+        offset: u64,
+    },
     /// Create the dotlock file exclusively (`O_CREAT | O_EXCL`), answered
     /// by [`MboxReply::DotlockCreate`].
     WantsDotlockCreate(MboxFsPath),
-    /// Remove a dotlock this coroutine created, answered by
-    /// [`MboxReply::DotlockRemove`].
+    /// Mark a dotlock this coroutine created as still in use, so no other
+    /// writer takes it for stale, answered by
+    /// [`MboxReply::DotlockRefresh`].
+    WantsDotlockRefresh(MboxFsPath),
+    /// Remove a dotlock this coroutine created, unless another writer
+    /// replaced it since, answered by [`MboxReply::DotlockRemove`].
     WantsDotlockRemove(MboxFsPath),
     /// Try to take an exclusive fcntl write lock on the whole file
     /// without blocking, answered by [`MboxReply::FcntlLock`].
@@ -154,6 +164,8 @@ pub enum MboxReply {
     /// Answer to [`MboxYield::WantsDotlockCreate`]: `false` when another
     /// process holds the dotlock.
     DotlockCreate(bool),
+    /// Acknowledgement of [`MboxYield::WantsDotlockRefresh`].
+    DotlockRefresh,
     /// Acknowledgement of [`MboxYield::WantsDotlockRemove`].
     DotlockRemove,
     /// Answer to [`MboxYield::WantsFcntlLock`]: `false` when another

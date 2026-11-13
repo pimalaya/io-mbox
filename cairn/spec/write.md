@@ -10,7 +10,7 @@ How the crate changes an mbox file.
 
 ### Requirement: Every write is locked
 
-Appending, rewriting and deleting SHALL first check the file exists, then take the dotlock (`<file>.lock`, created exclusively), then an exclusive fcntl lock on the file, retrying a busy lock every 100 ms up to a timeout (10 s by default, one too large to count in milliseconds waiting as long as one that can), and SHALL release both in reverse order whatever the outcome. A dotlock older than the stale age (300 s by default) SHALL be broken. Each lock MAY be skipped by option. A lock that cannot be taken SHALL fail the write.
+Appending, rewriting and deleting SHALL first check the file exists, then take the dotlock (`<file>.lock`, created exclusively), then an exclusive fcntl lock on the file, retrying a busy lock every 100 ms up to a timeout (10 s by default, one too large to count in milliseconds waiting as long as one that can), and SHALL release both in reverse order whatever the outcome. A dotlock older than the stale age (300 s by default) SHALL be broken. Each lock MAY be skipped by option. A lock that cannot be taken SHALL fail the write. A rewrite SHALL refresh its dotlock every 256 reads, 16 MiB at the default read size, so a rewrite longer than the stale age keeps it.
 
 ### Requirement: Appends pad and quote
 
@@ -18,7 +18,7 @@ An append to a non-empty file that does not open on a `From_` line, leading blan
 
 ### Requirement: Rewrites stay in place
 
-Flag changes and removals SHALL be applied under lock, after a sync of the index, by writing the new layout of the file from the first edited message to a temporary file (unchanged ranges copied, flag fields swapped at the end of the header, the digits of an `X-Mozilla-Status` swapped in place, an `X-Mozilla-Keys` field moved among the flag fields and written from the keywords, removed messages skipped), then copying it back over the file at the same offset, truncating and syncing. The file SHALL keep its inode, owner and mode. An edit leaving a message's flags unchanged SHALL be skipped, and a rewrite with nothing to do SHALL NOT touch the file. The temporary file SHALL be removed once copied back, and SHALL be kept when the copy back fails. Unless the sync scanned the whole file, each message to edit SHALL be scanned again from the file, separator included. The flags an edit is compared with and the places of the flag fields SHALL come from that scan. When the file no longer holds the same message there (content id, length and offset), the rewrite SHALL fail as stale, nothing written, and a rewrite given no index SHALL go through.
+Flag changes and removals SHALL be applied under lock, after a sync of the index, by writing the new layout of the file from the first edited message to a temporary file (unchanged ranges copied, flag fields swapped at the end of the header, the digits of an `X-Mozilla-Status` swapped in place, an `X-Mozilla-Keys` field moved among the flag fields and written from the keywords, removed messages skipped), then copying it back over the file at the same offset, truncating and syncing. The file SHALL keep its inode, owner and mode. An edit leaving a message's flags unchanged SHALL be skipped, and a rewrite with nothing to do SHALL NOT touch the file. The temporary file SHALL be removed once copied back, and SHALL be kept when the copy back fails. Unless the sync scanned the whole file, each message to edit SHALL be scanned again from the file, separator included. The flags an edit is compared with and the places of the flag fields SHALL come from that scan. When the file no longer holds the same message there (content id, length and offset), the rewrite SHALL fail as stale, nothing written, and a rewrite given no index SHALL go through. The entries to edit SHALL be found in one pass over the index, whatever the number of edits.
 
 #### Scenario: Another client marks a message read in place
 
@@ -42,7 +42,7 @@ Creating a mailbox SHALL create an empty file and its parent directories, and fa
 
 ### Requirement: A name stays below the root
 
-A mailbox name SHALL resolve to a path only when it has one segment at least, none of them `.` or `..`, and holds no NUL. Any other name SHALL be refused by every operation taking a name, before any filesystem request. `INBOX` SHALL still resolve to the spool wherever it lives.
+A mailbox name SHALL resolve to a path only when it has one segment at least, none of them `.` or `..`, and holds no NUL. Any other name SHALL be refused by every operation taking a name, before any filesystem request. `INBOX` SHALL still resolve to the spool wherever it lives. A name with a segment ending in `.lock` or `.msf` SHALL NOT resolve either: it names the dotlock or the summary of the mbox beside it, which a write to that mbox removes. The listing SHALL NOT walk a directory named so.
 
 ### Requirement: A listing walks each directory once
 

@@ -2,8 +2,9 @@
 //!
 //! The root is walked recursively. Every regular file is a mailbox, except
 //! hidden files and the side files of other tools (`.lock` dotlocks,
-//! Thunderbird `.msf` summaries). The spool, when set, is listed as
-//! `INBOX` if it exists.
+//! Thunderbird `.msf` summaries). A directory named like a dotlock or a
+//! summary is not walked, no name resolving into it. The spool, when set,
+//! is listed as `INBOX` if it exists.
 //!
 //! Each directory is walked once, whatever symbolic links lead to it: the
 //! walk tracks the canonical path of every directory it reaches, and a
@@ -22,11 +23,11 @@ use crate::{
     coroutine::*,
     mbox::Mbox,
     path::{MboxFsPath, MboxPath},
-    store::{INBOX, MboxStore},
+    store::{INBOX, LOCK, MSF, MboxStore},
 };
 
-/// Suffixes of files that are not mailboxes.
-const IGNORED_SUFFIXES: [&str; 3] = [".lock", ".msf", ".lck"];
+/// Suffix of a file another tool keeps beside an mbox, no mailbox.
+const LCK: &str = ".lck";
 
 /// Failure causes of a [`MboxList`] step.
 #[derive(Clone, Debug, Error)]
@@ -127,7 +128,8 @@ impl MboxCoroutine for MboxList {
                     let Some(name) = path.file_name() else {
                         continue;
                     };
-                    if name.starts_with('.') {
+                    let side = name.ends_with(LOCK) || name.ends_with(MSF);
+                    if name.starts_with('.') || side {
                         continue;
                     }
                     match kind {
@@ -137,7 +139,7 @@ impl MboxCoroutine for MboxList {
                         }
                         MboxFileKind::DirLink => self.links.push_back(path),
                         MboxFileKind::File => {
-                            if IGNORED_SUFFIXES.iter().any(|suffix| name.ends_with(suffix)) {
+                            if name.ends_with(LCK) {
                                 continue;
                             }
                             if self.store.inbox.as_ref() == Some(&path) {

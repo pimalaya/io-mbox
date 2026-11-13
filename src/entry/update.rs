@@ -62,7 +62,7 @@ use crate::{
         },
         tail_hash, tail_range,
     },
-    lock::{MboxLock, MboxLockOptions, acquire::*, release::*},
+    lock::{MboxLock, MboxLockOptions, REFRESH_READS, acquire::*, release::*},
     mbox_try,
     path::MboxFsPath,
     range::{MboxRange, MboxRangeCopy, MboxRangeCopyError},
@@ -147,6 +147,10 @@ pub struct MboxEntryUpdate {
     /// Whether the temporary file started to be copied back, after which
     /// it is the copy to recover from and must stay.
     copying_back: bool,
+    /// Reads done since the dotlock was taken or last refreshed.
+    reads: u32,
+    /// The read held back while the dotlock is refreshed.
+    held: Option<MboxReply>,
     result: Option<Result<MboxEntryUpdateOutput, MboxEntryUpdateError>>,
     state: State,
 }
@@ -169,6 +173,8 @@ impl MboxEntryUpdate {
             plan: Plan::default(),
             temp: None,
             copying_back: false,
+            reads: 0,
+            held: None,
             result: None,
             state: State::Check,
         }
@@ -332,7 +338,10 @@ impl MboxEntryUpdate {
         trace!("rewrite len: {}", self.plan.len);
 
         self.state = State::Temp;
-        MboxCoroutineState::Yielded(MboxYield::WantsTempFile)
+        MboxCoroutineState::Yielded(MboxYield::WantsTempFile {
+            path: self.path.clone(),
+            offset: self.plan.start,
+        })
     }
 
     /// Writes the next piece of the plan to the temporary file.
@@ -377,6 +386,22 @@ impl MboxCoroutine for MboxEntryUpdate {
     type Return = Result<MboxEntryUpdateOutput, MboxEntryUpdateError>;
 
     fn resume(&mut self, arg: Option<MboxReply>) -> MboxCoroutineState<Self::Yield, Self::Return> {
+        let mut arg = arg;
+
+        if let Some(MboxReply::DotlockRefresh) = arg {
+            arg = self.held.take();
+        } else if let Some(MboxReply::FileRead(_)) = arg
+            && self.lock.as_ref().is_some_and(|lock| lock.dotlock)
+        {
+            self.reads += 1;
+            if self.reads == REFRESH_READS {
+                self.reads = 0;
+                self.held = arg;
+                let dotlock = MboxLock::dotlock_path(&self.path);
+                return MboxCoroutineState::Yielded(MboxYield::WantsDotlockRefresh(dotlock));
+            }
+        }
+
         match (&mut self.state, arg) {
             (State::Check, None) => {
                 self.state = State::Checking;
@@ -410,12 +435,10 @@ impl MboxCoroutine for MboxEntryUpdate {
                 };
                 self.index = output.index;
 
-                for (id, edit) in mem::take(&mut self.edits) {
-                    let entries = &self.index.entries;
-                    let Some(pos) = entries.iter().position(|entry| entry.id == id) else {
-                        return self.finish(Err(MboxEntryUpdateError::MessageNotFound(id)));
-                    };
-                    self.located.insert(pos, edit);
+                let ids = self.index.entries.iter().map(|entry| entry.id.as_str());
+                self.located = locate(ids, &mut self.edits);
+                if let Some(id) = mem::take(&mut self.edits).into_keys().next() {
+                    return self.finish(Err(MboxEntryUpdateError::MessageNotFound(id)));
                 }
 
                 // NOTE: entries scanned under this very lock are what the
@@ -695,6 +718,26 @@ impl Plan {
     }
 }
 
+/// Moves out of `edits`, keyed by position, the ones whose id `ids` holds,
+/// in one pass over `ids`. The edits left name no message.
+fn locate<'a>(
+    ids: impl IntoIterator<Item = &'a str>,
+    edits: &mut BTreeMap<String, MboxEntryUpdateEdit>,
+) -> BTreeMap<usize, MboxEntryUpdateEdit> {
+    let mut located = BTreeMap::new();
+    let mut ids = ids.into_iter().enumerate();
+
+    while !edits.is_empty()
+        && let Some((pos, id)) = ids.next()
+    {
+        if let Some(edit) = edits.remove(id) {
+            located.insert(pos, edit);
+        }
+    }
+
+    located
+}
+
 /// A piece of the rewritten tail.
 #[derive(Debug)]
 enum Piece {
@@ -890,7 +933,7 @@ mod tests {
                     MboxReply::FileTruncate
                 }
                 MboxYield::WantsFileSync(_) => MboxReply::FileSync,
-                MboxYield::WantsTempFile => {
+                MboxYield::WantsTempFile { .. } => {
                     self.temps += 1;
                     let path = format!("temp{}", self.temps);
                     self.files.insert(path.clone(), Vec::new());
@@ -1218,6 +1261,98 @@ body three
             assert_eq!(String::from_utf8_lossy(fs.mbox()), rewritten);
             assert_eq!(fs.files.len(), 1, "no temp file left");
         }
+    }
+
+    #[test]
+    fn locating_edits_reads_the_index_once() {
+        let ids: Vec<String> = (0..1000).map(|i| format!("id{i}")).collect();
+        let remove = |id: &String| (id.clone(), MboxEntryUpdateEdit::Remove);
+        let mut edits: BTreeMap<_, _> = ids.iter().map(remove).collect();
+        edits.insert("missing".into(), MboxEntryUpdateEdit::Remove);
+
+        let mut visits = 0;
+        let seen = ids.iter().map(String::as_str).inspect(|_| visits += 1);
+        let located = locate(seen, &mut edits);
+        assert_eq!(visits, 1000);
+        assert_eq!(located.len(), 1000);
+        assert_eq!(edits.into_keys().collect::<Vec<_>>(), ["missing"]);
+
+        let mut edits = BTreeMap::from([remove(&ids[3])]);
+        let mut visits = 0;
+        let seen = ids.iter().map(String::as_str).inspect(|_| visits += 1);
+        let located = locate(seen, &mut edits);
+        assert_eq!(visits, 4, "the pass stops once every edit is found");
+        assert_eq!(located.into_keys().collect::<Vec<_>>(), [3]);
+    }
+
+    #[test]
+    fn a_long_rewrite_refreshes_its_dotlock() {
+        let bytes = b"From a@b Mon Jan  1 00:00:00 2024\nSubject: x\n\nbody\n\n".repeat(200);
+        let entries = scan(&bytes);
+        let mut fs = memfs(&bytes);
+        let edits = BTreeMap::from([(entries[0].id.clone(), MboxEntryUpdateEdit::Remove)]);
+        let opts = MboxEntryUpdateOptions {
+            lock: MboxLockOptions {
+                skip_fcntl: true,
+                ..Default::default()
+            },
+            chunk_size: Some(8),
+            ..Default::default()
+        };
+        let mut cor = MboxEntryUpdate::new(MboxFsPath::new("mbox"), edits, opts);
+        let mut arg = None;
+        let (mut reads, mut refreshes) = (0, 0);
+        let out = loop {
+            let y = match cor.resume(arg.take()) {
+                MboxCoroutineState::Complete(result) => break result.unwrap(),
+                MboxCoroutineState::Yielded(y) => y,
+            };
+            arg = Some(match y {
+                MboxYield::WantsDotlockCreate(_) => MboxReply::DotlockCreate(true),
+                MboxYield::WantsDotlockRemove(_) => MboxReply::DotlockRemove,
+                MboxYield::WantsDotlockRefresh(path) => {
+                    assert_eq!(path.as_str(), "mbox.lock");
+                    assert_eq!(reads % REFRESH_READS, 0);
+                    refreshes += 1;
+                    MboxReply::DotlockRefresh
+                }
+                y => {
+                    reads += matches!(y, MboxYield::WantsFileRead { .. }) as u32;
+                    fs.answer(y)
+                }
+            });
+        };
+
+        assert!(reads > 10 * REFRESH_READS);
+        assert_eq!(refreshes, reads / REFRESH_READS);
+        assert_eq!(out.index.entries, scan(fs.mbox()));
+    }
+
+    #[test]
+    fn the_temp_file_is_asked_for_the_rewritten_tail() {
+        let entries = scan(MBOX);
+        let mut fs = memfs(MBOX);
+        let edits = BTreeMap::from([(entries[1].id.clone(), MboxEntryUpdateEdit::Remove)]);
+        let opts = MboxEntryUpdateOptions {
+            lock: MboxLockOptions {
+                skip_dotlock: true,
+                skip_fcntl: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut cor = MboxEntryUpdate::new(MboxFsPath::new("mbox"), edits, opts);
+        let mut arg = None;
+        let asked = loop {
+            match cor.resume(arg.take()) {
+                MboxCoroutineState::Yielded(MboxYield::WantsTempFile { path, offset }) => {
+                    break (path, offset);
+                }
+                MboxCoroutineState::Yielded(y) => arg = Some(fs.answer(y)),
+                state => panic!("unexpected {state:?}"),
+            }
+        };
+        assert_eq!(asked, (MboxFsPath::new("mbox"), entries[1].offset));
     }
 
     #[test]

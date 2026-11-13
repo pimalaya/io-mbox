@@ -19,6 +19,9 @@ pub const SBD: &str = ".sbd";
 /// rebuilds when missing.
 pub const MSF: &str = ".msf";
 
+/// Suffix of the dotlock of an mbox.
+pub const LOCK: &str = ".lock";
+
 /// Directory holding mbox files, plus the spool and the layout used to
 /// translate logical mailbox names to on-disk paths.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -40,7 +43,9 @@ impl MboxStore {
     ///
     /// `INBOX` (any case) resolves to [`Self::inbox`] when set. Otherwise
     /// `a/b` resolves to `<root>/a/b`, or `<root>/a.sbd/b` in the
-    /// Thunderbird layout.
+    /// Thunderbird layout. A segment ending in `.lock` or `.msf` does not
+    /// resolve either: it is the dotlock or the summary of the mbox
+    /// beside it, which a write to that mbox removes.
     pub fn resolve(&self, name: &MboxPath) -> Option<MboxFsPath> {
         if let Some(inbox) = &self.inbox
             && name.as_str().eq_ignore_ascii_case(INBOX)
@@ -48,7 +53,8 @@ impl MboxStore {
             return Some(inbox.clone());
         }
 
-        if !name.names_mbox() {
+        let side = |c: &str| c.ends_with(LOCK) || c.ends_with(MSF);
+        if !name.names_mbox() || name.components().any(side) {
             return None;
         }
 
@@ -117,6 +123,17 @@ mod tests {
         let spool = MboxFsPath::new("/var/mail/me");
         assert_eq!(store.resolve(&MboxPath::from("inbox")), Some(spool.clone()));
         assert_eq!(store.relative(&spool), Some(MboxPath::from("INBOX")));
+    }
+
+    #[test]
+    fn a_name_of_a_side_file_does_not_resolve() {
+        let store = store(false);
+        for name in ["x.lock", "x.msf", ".lock", "a.lock/b", "a/b.msf"] {
+            assert_eq!(store.resolve(&MboxPath::from(name)), None, "{name}");
+        }
+        for name in ["x.locked", "lock", "x.lock.old", "msf/a"] {
+            assert!(store.resolve(&MboxPath::from(name)).is_some(), "{name}");
+        }
     }
 
     #[test]

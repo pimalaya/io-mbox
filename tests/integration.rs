@@ -157,7 +157,7 @@ fn end_to_end() {
     let leftovers: Vec<_> = fs::read_dir(tmp.path())
         .unwrap()
         .filter_map(|e| e.ok())
-        .filter(|e| e.file_name().to_string_lossy().starts_with("io-mbox-"))
+        .filter(|e| e.file_name().to_string_lossy().contains("io-mbox-"))
         .collect();
     assert!(leftovers.is_empty(), "temporary files left behind");
     assert!(!tmp.path().join("spool.lock").exists());
@@ -258,6 +258,57 @@ fn a_listing_walks_each_directory_once() {
         .map(|m| m.name.to_string())
         .collect();
     assert_eq!(names, ["a", "alias", "far/c", "sub/b"]);
+}
+
+#[test]
+fn a_mailbox_cannot_be_named_after_a_side_file() {
+    let tmp = tempdir().unwrap();
+    let client = client(&tmp);
+    client.create_mbox("x").unwrap();
+
+    for name in ["x.lock", "x.msf", "x.lock/y", "y/x.msf"] {
+        let created = client.create_mbox(name);
+        assert!(
+            matches!(created, Err(MboxClientError::InvalidName(_))),
+            "{name}"
+        );
+        let appended = client.append(name, vec![item("x")]);
+        assert!(
+            matches!(appended, Err(MboxClientError::InvalidName(_))),
+            "{name}"
+        );
+    }
+
+    fs::create_dir(tmp.path().join("mail/dir.lock")).unwrap();
+    fs::write(tmp.path().join("mail/dir.lock/hidden"), b"").unwrap();
+    let names: Vec<String> = client
+        .list_mboxes()
+        .unwrap()
+        .into_iter()
+        .map(|m| m.name.to_string())
+        .collect();
+    assert_eq!(names, ["x"]);
+}
+
+#[test]
+fn a_rewrite_leaves_no_temp_file_beside_the_mbox() {
+    let tmp = tempdir().unwrap();
+    let mut client = client(&tmp);
+    client.temp_dir = None;
+    client.create_mbox("box").unwrap();
+    let appended = client
+        .append("box", vec![item("one"), item("two")])
+        .unwrap();
+
+    let edits = BTreeMap::from([(appended[0].id.clone(), MboxEntryUpdateEdit::Remove)]);
+    let out = client.update("box", edits, None).unwrap();
+    assert_eq!(out.removed, 1);
+
+    let left: Vec<String> = fs::read_dir(tmp.path().join("mail"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(left, ["box"]);
 }
 
 #[test]

@@ -4,7 +4,9 @@
 //! MTAs and MUAs agree on: first the dotlock (the file `<mbox>.lock`,
 //! created exclusively), then an fcntl write lock on the mbox itself.
 //! A dotlock older than [`MboxLockOptions::stale_secs`] is taken as
-//! left behind by a crashed writer and broken.
+//! left behind by a crashed writer and broken. So a writer refreshes its
+//! dotlock while a long rewrite runs, and a release leaves alone a
+//! dotlock another writer replaced.
 //!
 //! [`acquire`] takes both and [`release`] drops them. The write
 //! coroutines of [`crate::entry`] and [`crate::mbox`] run them around
@@ -15,7 +17,7 @@
 pub mod acquire;
 pub mod release;
 
-use crate::path::MboxFsPath;
+use crate::{path::MboxFsPath, store::LOCK};
 
 /// Default time to wait for a lock.
 pub(crate) const TIMEOUT_SECS: u64 = 10;
@@ -25,6 +27,10 @@ pub(crate) const STALE_SECS: u64 = 300;
 
 /// Delay between two attempts at a busy lock.
 pub(crate) const RETRY_MS: u64 = 100;
+
+/// Reads a writer does between two refreshes of its dotlock: 16 MiB at
+/// the default read size.
+pub(crate) const REFRESH_READS: u32 = 256;
 
 /// Which locks to take, and how long to wait for them.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -54,6 +60,6 @@ pub struct MboxLock {
 impl MboxLock {
     /// Path of the dotlock of `path`.
     pub fn dotlock_path(path: &MboxFsPath) -> MboxFsPath {
-        path.with_suffix(".lock")
+        path.with_suffix(LOCK)
     }
 }
